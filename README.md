@@ -1,4 +1,5 @@
 # Real Windows for Kerbal Space Program 1.12
+<img width="1300" height="720" alt="SSTO" src="https://github.com/user-attachments/assets/1bbacb9a-8ea4-43bc-aca3-f702d5751d0c" />
 
 ## Features
 
