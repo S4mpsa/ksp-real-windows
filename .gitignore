@@ -1,0 +1,26 @@
+# Unity: regenerated when the project is opened or built
+/unity/[Ll]ibrary/
+/unity/[Tt]emp/
+/unity/[Ll]ogs/
+/unity/[Uu]ser[Ss]ettings/
+/unity/[Oo]bj/
+/unity/[Bb]uild/
+/unity/*.csproj
+/unity/*.sln
+/unity/.vs/
+
+# build outputs
+/GameData/RealWindows/Plugins/
+/GameData/RealWindows/PluginData/
+/GameData/RealWindows/settings.cfg.new
+/tools/build.rsp
+/tools/build-shaders.log
+bin/
+obj/
+
+# misc
+__pycache__/
+*.pyc
+.vs/
+.vscode/
+.idea/
