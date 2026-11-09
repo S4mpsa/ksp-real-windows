@@ -66,6 +66,21 @@ namespace RealWindows
 
         // How far the interior of `p` would be displaced if rendered with map `m`
         // instead of its own map (`own`): position error at the part, and angle.
+        // KSP's own world -> internal-space map (through the active vessel). Used for
+        // interiors whose whole root spins with a centrifuge (Kerbalism's GravityRing;
+        // FreeIva turns the root with the ring): the root's pose then holds the spin,
+        // and a map built from it would cancel the spin out. FreeIva re-places every
+        // interior from this same map each frame, so it is exact there.
+        public static bool Stock(out RigidMap k)
+        {
+            k = default(RigidMap);
+            if (InternalSpace.Instance == null || FlightGlobals.ActiveVessel == null)
+                return false;
+            k.rot = InternalSpace.WorldToInternal(Quaternion.identity);
+            k.pos = InternalSpace.WorldToInternal(Vector3.zero);
+            return true;
+        }
+
         public static void Disagreement(RigidMap m, RigidMap own, Vector3 partPos, out float meters, out float degrees)
         {
             meters = (m.Apply(partPos) - own.Apply(partPos)).magnitude;

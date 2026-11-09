@@ -9,17 +9,24 @@
 //      only if nothing lit and tinted exists, which would mark the real windows.
 //      Gloss only: a real opening behind most of it, and only on a texture with
 //      no lightmap. Where one exists, what it leaves dark isn't a window.
+//      Unlit warm paint (gold foil, copper, brown) is never a window, and
+//      untinted gloss is one only on a part with no lightmap anywhere.
 //      Named as a window (mesh name): every UV island is a candidate, kept if an
 //      opening is behind most of it; if one of them is tinted, dark unlit neutral
 //      ones are frame. If none is kept, the mesh is solid.
 //   3. Boundary, from the mesh: a pane is often its own UV island. A confirmed
 //      region that fills most of its island takes the whole island, which is
-//      the exact outline even where the paint just fades out.
+//      the exact outline even where the paint just fades out. When the window is
+//      tinted glass, unlit dark neutral texels of the island are frame and stay
+//      out (panes sharing one island with their black frames and mullions).
 //   4. Boundary, from the paint: a confirmed region keeps only the texels painted
 //      like its glass (its core); a lightmap or gloss blob that overhangs the
 //      pane onto the frame is cut back, so no blocky outline survives. The core
 //      then floods outward over similar colour until the colour jumps. Glass is roughly one colour inside
 //      a dark frame, so the frame gives the outline, however soft the gloss is.
+//      Around tinted glass the flood never enters bright neutral paint (lightmap
+//      glow on the panel) or dark neutral paint the lightmap leaves unlit (the
+//      frame, even where the pane's paint fades softly into it).
 //   5. Clean-up: close small gaps, soften the edge for bilinear sampling.
 
 using System;
@@ -44,6 +51,7 @@ namespace RealWindows
         public float islandFill = 0.8f;    // a region this share of its UV island takes the whole island
         public bool acceptAll;             // Trust: skip the IVA confirmation
         public bool addOpenings;           // Union: openings without gloss are windows too
+        public bool partLit;               // another texture of the part has a lightmap: its windows are lit there
     }
 
     public static class MaskRegions
@@ -105,12 +113,19 @@ namespace RealWindows
                 // round panes). Light neutral islands stay: some panes are UV-mapped onto
                 // plain hull paint.
                 bool darkFrame = !r.tinted && !r.lit && Math.Max(r.meanR, Math.Max(r.meanG, r.meanB)) <= p.colourTolerance * 3;
-                if (p.seedAllCovered) ok = here >= p.minOpenFraction && !(darkFrame && tintedNamedExists);
+                // Warm paint (red well above blue: gold foil, copper, brown) is never glass.
+                // A shiny gold insulation foil passed as a gloss-only window wherever a big,
+                // sparse IVA had openings behind it (the SSPX 'Cronus' centrifuge's end caps).
+                bool warm = !r.lit && r.meanR - r.meanB >= p.tintThreshold * 3 && r.meanR >= r.meanG;
+                if (p.seedAllCovered) ok = here >= p.minOpenFraction && !(darkFrame && tintedNamedExists) && !warm;
                 else if (p.seedFromOpenings) ok = r.tinted; // the opening is given; only glass-coloured paint counts
                 else if (p.acceptAll) ok = true;
                 else if (r.lit && r.tinted) ok = near >= p.minOpenLit;
                 else if (r.lit) ok = !tintedLitExists && here >= p.minOpenFraction;
-                else ok = !p.hasLightmap && here >= p.minOpenFraction && (r.tinted || !tintedGlossExists);
+                // Neutral gloss counts only on parts with no lightmap at all: where the
+                // author lit the windows on another texture, shiny grey paint here is
+                // metal (the SSPX 'Cronus' centrifuge's struts and spin core).
+                else ok = !p.hasLightmap && here >= p.minOpenFraction && (r.tinted || (!tintedGlossExists && !p.partLit)) && !warm;
                 r.fate = ok ? Fate.Window : Fate.Rejected;
                 if (ok) accepted++; else rejected++;
                 if (report != null)
@@ -129,10 +144,10 @@ namespace RealWindows
             if (accepted > 0)
             {
                 // a named mesh's islands are the candidates already; refilling them would undo the rim trim
-                int filled = p.seedAllCovered ? 0 : FillIslands(w, h, state, cover, p, queue);
+                int filled = p.seedAllCovered ? 0 : FillIslands(w, h, state, cover, rgb, light, p, queue);
                 if (report != null && filled > 0)
                     report.Add(string.Format("islands {0}", filled));
-                Grow(w, h, state, label, regions, cover, rgb, p, queue);
+                Grow(w, h, state, label, regions, cover, rgb, light, p, queue);
             }
 
             if (p.addOpenings)
@@ -158,6 +173,29 @@ namespace RealWindows
         {
             return r.tinted && rgb[i * 3 + 2] - rgb[i * 3] < p.tintThreshold / 2
                 && rgb[i * 3] > r.meanR + p.colourTolerance * 3;
+        }
+
+        // Dark neutral paint next to tinted glass, where the lightmap doesn't light
+        // it: the frame. A soft edge on the pane fades into it, and the flood would
+        // follow that fade and spread over the whole frame (the NFS 'Rhea' pod's
+        // black window frames). Dark reflections painted into the glass are lit
+        // with the pane (the stock Cupola), so they stay.
+        private static bool IsFrame(int i, Region r, byte[] rgb, byte[] light, MaskParams p)
+        {
+            return r.tinted && Unlit(i, light, p) && DarkNeutral(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2],
+                Math.Max(r.meanR, Math.Max(r.meanG, r.meanB)), p);
+        }
+
+        private static bool Unlit(int i, byte[] light, MaskParams p)
+        {
+            return p.hasLightmap && light != null && light[i] < p.seedLight;
+        }
+
+        // No channel within the colour tolerance of the glass's brightest, and blue
+        // not above red: frame paint, not glass.
+        private static bool DarkNeutral(int r, int g, int b, int glassTop, MaskParams p)
+        {
+            return b - r < p.tintThreshold / 2 && Math.Max(r, Math.Max(g, b)) < glassTop - p.colourTolerance;
         }
 
         // Painted like the region's glass: within twice the colour tolerance of its
@@ -232,8 +270,10 @@ namespace RealWindows
         }
 
         // Walks every UV island; a window region taking up enough of one fills it.
-        // Texels added here have no region label, so Grow leaves them alone.
-        private static int FillIslands(int w, int h, byte[] state, byte[] cover, MaskParams p, int[] queue)
+        // Texels added here have no region label, so Grow leaves them alone. Where
+        // the island's window texels are tinted glass, unlit dark neutral texels
+        // are frame (as in IsFrame) and aren't filled.
+        private static int FillIslands(int w, int h, byte[] state, byte[] cover, byte[] rgb, byte[] light, MaskParams p, int[] queue)
         {
             int filled = 0;
             bool[] seen = new bool[state.Length];
@@ -242,12 +282,17 @@ namespace RealWindows
                 if (cover[start] == 0 || seen[start])
                     continue;
                 int head = 0, tail = 0, windows = 0, rejected = 0;
+                long sr = 0, sg = 0, sb = 0;
                 queue[tail++] = start;
                 seen[start] = true;
                 while (head < tail)
                 {
                     int i = queue[head++];
-                    if (state[i] == Window) windows++;
+                    if (state[i] == Window)
+                    {
+                        windows++;
+                        if (rgb != null) { sr += rgb[i * 3]; sg += rgb[i * 3 + 1]; sb += rgb[i * 3 + 2]; }
+                    }
                     else if (state[i] == Rejected) rejected++;
                     int x = i % w, y = i / w;
                     if (x > 0) Visit(i - 1);
@@ -258,8 +303,24 @@ namespace RealWindows
                 if (windows < p.minArea || windows < tail * p.islandFill || rejected > windows)
                     continue;
                 filled++;
+                bool frames = false;
+                int glassTop = 0;
+                if (rgb != null && p.colourTolerance >= 0)
+                {
+                    int mr = (int)(sr / windows), mg = (int)(sg / windows), mb = (int)(sb / windows);
+                    frames = mb - mr >= p.tintThreshold;
+                    glassTop = Math.Max(mr, Math.Max(mg, mb));
+                }
                 for (int k = 0; k < tail; k++)
-                    state[queue[k]] = Window;
+                {
+                    int i = queue[k];
+                    if (frames && state[i] != Window)
+                    {
+                        if (Unlit(i, light, p) && DarkNeutral(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2], glassTop, p))
+                            continue; // the frame around tinted glass
+                    }
+                    state[i] = Window;
+                }
 
                 void Visit(int j)
                 {
@@ -277,7 +338,7 @@ namespace RealWindows
         // adapting reference colour: a gentle gradient across the glass is followed,
         // a sharp step (the frame) stops the flood.
         private static void Grow(int w, int h, byte[] state, int[] label, List<Region> regions,
-            byte[] cover, byte[] rgb, MaskParams p, int[] queue)
+            byte[] cover, byte[] rgb, byte[] light, MaskParams p, int[] queue)
         {
             int n = w * h;
             float[] refc = new float[n * 3];
@@ -319,7 +380,8 @@ namespace RealWindows
                 if (state[to] != 0 || cover[to] == 0)
                     return;
                 int c = to * 3, f = from * 3;
-                if (IsPanel(to, regions[label[from] - 1], rgb, p))
+                Region rf = regions[label[from] - 1];
+                if (IsPanel(to, rf, rgb, p) || IsFrame(to, rf, rgb, light, p))
                     return;
                 if (Math.Abs(rgb[c] - refc[f]) > tol
                     || Math.Abs(rgb[c + 1] - refc[f + 1]) > tol

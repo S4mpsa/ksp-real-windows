@@ -16,6 +16,8 @@
 //      redrawn only when the view of it changes, every `interiorRefresh`
 //      seconds, or on RealWindowsApi.RequestRedraw(); the kerbals layer is drawn
 //      every frame over a copy of it, depth-tested against the cached depth.
+//      Interiors that move (a spinning ring) stay out of the cache and are drawn
+//      whole with the kerbals every frame, so the rest stays cached.
 //   4. Composite      (command buffer on the main camera): the interior where
 //      the hull pixel is a window and the interior seen there is that part's or
 //      one drawn in the same render, with the glass look on top. With the camera
@@ -69,7 +71,6 @@ namespace RealWindows
         private Rect staticRect;
         private Matrix4x4 staticProj;
         private int staticHash;
-        private Vector4 staticShellSum;
         private readonly List<Vector3> staticPos = new List<Vector3>();
         private readonly List<Quaternion> staticRot = new List<Quaternion>();
         public int staticRedraws, staticReuses;   // for the status line
@@ -91,6 +92,7 @@ namespace RealWindows
         private CameraEvent insideEvent;
         private bool insideAttached;
         private readonly List<Renderer> masksHidden = new List<Renderer>();
+        private readonly List<Renderer> staticHidden = new List<Renderer>();   // cached interiors' shell/props, off in the Kerbals pass
         // render group of each part id (index = id, -1 none): the composite lets a
         // window show another part's interior when both were drawn in one render
         // (an open hatch looking into the next cabin)
@@ -106,6 +108,10 @@ namespace RealWindows
         private readonly Dictionary<Part, PartPortal> byPart = new Dictionary<Part, PartPortal>();
         private readonly HashSet<PartPortal> context = new HashSet<PartPortal>();
         private PartPortal insidePart;   // the interior the camera is in, if any
+        // IVA view: the IVA camera draws the part it is in (and FreeIva's kerbal may
+        // float into another); those are never rendered here, and nothing is "inside"
+        public bool ivaView;
+        public Part ivaPart;
         public int insideId;
         private readonly Plane[] planes = new Plane[6];       // full view
         private readonly Plane[] cropPlanes = new Plane[6];   // the screen area the windows cover
@@ -576,22 +582,23 @@ namespace RealWindows
         // interior whole, like the stock interior overlay.
         private PartPortal FindCameraInside()
         {
-            if (!RWSettings.showInteriorWhenInside)
+            if (!RWSettings.showInteriorWhenInside || ivaView)
                 return null;
-            Vector3 cam = main.transform.position;
             for (int i = 0; i < interiors.Count; i++)
-            {
-                PartPortal p = interiors[i];
-                if (p.part == null || !p.InteriorUsable || !p.haveShellBounds || p.distance > 15f)
-                    continue;
-                RigidMap m = Alignment.Compute(p.part.transform, p.model.transform);
-                Vector3 local = p.model.transform.InverseTransformPoint(m.Apply(cam));
-                Bounds b = p.shellLocalBounds;
-                b.Expand(-0.1f);
-                if (b.Contains(local))
-                    return p;
-            }
+                if (CameraIn(interiors[i]))
+                    return interiors[i];
             return null;
+        }
+
+        private bool CameraIn(PartPortal p)
+        {
+            if (p.part == null || !p.InteriorUsable || !p.haveShellBounds || p.distance > 15f)
+                return false;
+            RigidMap m = p.LiveMap();
+            Vector3 local = p.model.transform.InverseTransformPoint(m.Apply(main.transform.position));
+            Bounds b = p.shellLocalBounds;
+            b.Expand(-0.1f);
+            return b.Contains(local);
         }
 
         private void BuildGroups()
@@ -613,6 +620,12 @@ namespace RealWindows
                 PartPortal p = interiors[i];
                 if (p.part == null || p.part.vessel == null || !p.InteriorUsable)
                     continue;
+                // IVA: the IVA camera's own part (drawn by it) isn't rendered
+                if (ivaView && (p.part == ivaPart || CameraIn(p)))
+                {
+                    lastCulled++;
+                    continue;
+                }
                 // no window in view, too small to see, or none at all: skip the interior
                 // (never the one the camera is in: it is seen whole, see the composite)
                 Bounds wb;
@@ -625,7 +638,7 @@ namespace RealWindows
                 if (!haveRect) { windowRect = area; haveRect = true; }
                 else windowRect = Rect.MinMaxRect(Mathf.Min(windowRect.xMin, area.xMin), Mathf.Min(windowRect.yMin, area.yMin),
                                                    Mathf.Max(windowRect.xMax, area.xMax), Mathf.Max(windowRect.yMax, area.yMax));
-                p.map = Alignment.Compute(p.part.transform, p.model.transform);
+                p.map = p.LiveMap();
                 p.frameId = ++id;
                 lastInteriorCount++;
 
@@ -684,6 +697,10 @@ namespace RealWindows
             for (int i = 0; i < allInteriors.Count; i++)
                 if (allInteriors[i].part != null)
                     byPart[allInteriors[i].part] = allInteriors[i];
+
+            float now = Time.unscaledTime;
+            for (int i = 0; i < allInteriors.Count; i++)
+                allInteriors[i].UpdateMotion(now);
 
             bool split = RWSettings.interiorRefresh >= 0f && staticColorRT != null && staticDepthRT != null && dynDepthRT != null;
             if (split)
@@ -764,10 +781,40 @@ namespace RealWindows
                 // only this group's interiors and their neighbours (SetForceOff skips unchanged
                 // ones). Parked interiors (other vessels, hidden from the stock cameras) are
                 // switched on for their own render and parked again afterwards.
+                // A moving interior stays out of the cache (Static) and is drawn whole in the
+                // Kerbals pass; there, everything else shows only its crew.
+                bool movingHere = false;
                 for (int i = 0; i < allInteriors.Count; i++)
                 {
                     PartPortal q = allInteriors[i];
-                    q.SetForceOff(!((q.frameId > 0 && q.group == g) || context.Contains(q)));
+                    bool show = (q.frameId > 0 && q.group == g) || context.Contains(q);
+                    if (show && q.Moving)
+                    {
+                        if (pass == ColourPass.Static) show = false;
+                        else movingHere = true;
+                    }
+                    q.SetForceOff(!show);
+                }
+                staticHidden.Clear();
+                if (pass == ColourPass.Kerbals)
+                {
+                    intCam.cullingMask = movingHere ? (1 << LayerKerbals) | (1 << LayerInternal) : 1 << LayerKerbals;
+                    if (movingHere)
+                        for (int i = 0; i < allInteriors.Count; i++)
+                        {
+                            PartPortal q = allInteriors[i];
+                            if (q.Moving || !((q.frameId > 0 && q.group == g) || context.Contains(q)))
+                                continue;
+                            for (int k = 0; k < q.nonKerbalRenderers.Count; k++)
+                            {
+                                Renderer r = q.nonKerbalRenderers[k];
+                                if (r != null && !r.forceRenderingOff)
+                                {
+                                    r.forceRenderingOff = true;
+                                    staticHidden.Add(r);
+                                }
+                            }
+                        }
                 }
                 flippedEnabled.Clear();
                 masksHidden.Clear();
@@ -810,15 +857,19 @@ namespace RealWindows
                 for (int k = 0; k < masksHidden.Count; k++)
                     if (masksHidden[k] != null)
                         masksHidden[k].forceRenderingOff = false;
+                for (int k = 0; k < staticHidden.Count; k++)
+                    if (staticHidden[k] != null)
+                        staticHidden[k].forceRenderingOff = false;
+                staticHidden.Clear();
             }
         }
 
         // The cached layer is redrawn when anything that shapes its picture
         // changed: the view of each group's interiors (camera pose mapped into
-        // internal space), the projection, which interiors are drawn, a crop
-        // area that now reaches past the cached one, shell meshes moving inside
-        // their interior (centrifuges); and every `interiorRefresh` seconds
-        // (lighting, animated props) or when another mod asks.
+        // internal space), the projection, which interiors are drawn and which of
+        // them move (a moving interior leaves the cache, and rejoins it 2 s after
+        // stopping), a crop area that now reaches past the cached one; and every
+        // `interiorRefresh` seconds (lighting, animated props) or when another mod asks.
         private bool StaticStale()
         {
             if (staticAt < 0f || RealWindowsApi.TakeRedrawRequest())
@@ -835,9 +886,6 @@ namespace RealWindows
             for (int k = 0; k < 16; k++)
                 if (Mathf.Abs(proj[k] - staticProj[k]) > 1e-5f)
                     return true;
-            Vector4 shell = ShellSum();
-            if ((shell - staticShellSum).sqrMagnitude > 1e-6f)
-                return true;
             Transform camT = main.transform;
             float maxMove = RWSettings.interiorRedrawMove, maxTurn = RWSettings.interiorRedrawTurn;
             for (int g = 0; g < groups.Count; g++)
@@ -856,7 +904,6 @@ namespace RealWindows
             staticRect = windowRect;
             staticProj = main.nonJitteredProjectionMatrix;
             staticHash = ViewHash();
-            staticShellSum = ShellSum();
             staticPos.Clear();
             staticRot.Clear();
             Transform camT = main.transform;
@@ -865,37 +912,6 @@ namespace RealWindows
                 staticPos.Add(groups[g].map.Apply(camT.position));
                 staticRot.Add(groups[g].map.Apply(camT.rotation));
             }
-        }
-
-        // Where the shell meshes of the drawn interiors sit inside their interiors,
-        // summed: changes when part of an interior moves (a spinning centrifuge).
-        private Vector4 ShellSum()
-        {
-            Vector4 s = Vector4.zero;
-            for (int g = 0; g < groups.Count; g++)
-            {
-                List<PartPortal> ms = groups[g].members;
-                for (int m = 0; m < ms.Count; m++)
-                {
-                    PartPortal p = ms[m];
-                    if (p.model == null)
-                        continue;
-                    Transform root = p.model.transform;
-                    Renderer last = null;
-                    for (int k = 0; k < p.interiorShell.Count; k++)
-                    {
-                        Renderer r = p.interiorShell[k].r;
-                        if (r == null || r == last)
-                            continue; // sub-meshes of one renderer share a transform
-                        last = r;
-                        Transform t = r.transform;
-                        Vector3 pos = root.InverseTransformPoint(t.position);
-                        Vector3 fwd = root.InverseTransformDirection(t.forward);
-                        s += new Vector4(pos.x + fwd.x, pos.y + fwd.y, pos.z + fwd.z, (k + 1) * (fwd.x - fwd.z));
-                    }
-                }
-            }
-            return s;
         }
 
         // Which interiors are drawn, in which group, and which instance each is.
@@ -912,7 +928,8 @@ namespace RealWindows
                         h = h * 31 + (ms[m].model != null ? ms[m].model.GetInstanceID() : 0);
                 }
                 for (int i = 0; i < allInteriors.Count; i++)
-                    h = h * 31 + (allInteriors[i].model != null ? allInteriors[i].model.GetInstanceID() : 0);
+                    h = h * 31 + (allInteriors[i].model != null ? allInteriors[i].model.GetInstanceID() : 0) * 2
+                        + (allInteriors[i].Moving ? 1 : 0); // moving ones leave the cache, stopped ones rejoin it
                 return h;
             }
         }

@@ -48,6 +48,7 @@ namespace RealWindows
             GameEvents.onVesselCrewWasModified.Add(OnCrewModified);
             GameEvents.onVesselWasModified.Add(OnCrewModified);
             ok = true;
+            CentrifugeTwist.Hook();
             switchedOn = RWSettings.startEnabled;
             RWLog.Info("v{0} active in flight ({1}, toggle key {2})", AssemblyInfo.Version, switchedOn ? "on" : "off", RWSettings.toggleKey);
         }
@@ -58,6 +59,7 @@ namespace RealWindows
             GameEvents.onVesselChange.Remove(OnVesselChanged);
             GameEvents.onVesselCrewWasModified.Remove(OnCrewModified);
             GameEvents.onVesselWasModified.Remove(OnCrewModified);
+            CentrifugeTwist.Unhook();
             if (pipeline != null)
                 pipeline.Dispose();
             pipeline = null;
@@ -222,9 +224,17 @@ namespace RealWindows
             Camera cam = FlightCamera.fetch != null ? FlightCamera.fetch.mainCamera : null;
             CameraManager.CameraMode mode = CameraManager.Instance != null
                 ? CameraManager.Instance.currentCameraMode : CameraManager.CameraMode.Flight;
-            bool exteriorView = mode == CameraManager.CameraMode.Flight || mode == CameraManager.CameraMode.External;
+            // IVA: the flight camera still renders the outside from the kerbal's eyes
+            // and the IVA camera draws over it, the outside showing through its
+            // windows; so the composite works there too (the IVA's own part excluded)
+            bool iva = mode == CameraManager.CameraMode.IVA || mode == CameraManager.CameraMode.Internal;
+            bool exteriorView = mode == CameraManager.CameraMode.Flight || mode == CameraManager.CameraMode.External
+                                || (iva && RWSettings.ivaView);
             bool active = cam != null && exteriorView && !MapView.MapIsEnabled && !stockOverlayOn
                           && FlightGlobals.ActiveVessel != null && InternalSpace.Instance != null;
+            pipeline.ivaView = iva;
+            Kerbal ivaKerbal = iva && CameraManager.Instance != null ? CameraManager.Instance.IVACameraActiveKerbal : null;
+            pipeline.ivaPart = ivaKerbal != null ? ivaKerbal.InPart : null;
 
             if (now >= nextPrune)
             {
@@ -233,6 +243,7 @@ namespace RealWindows
             }
 
             RefreshLists(cam, active, now);
+            CentrifugeTwist.Track(pipeline.allInteriors);
             pipeline.UpdateParking();
             pipeline.wantActive = active;
 
@@ -314,7 +325,7 @@ namespace RealWindows
                     pp.MaybeScanExterior(now);
                     pipeline.occluders.Add(pp);
 
-                    if (!pp.hasIva || pp.excluded || !vesselEligible || d > RWSettings.maxDistance)
+                    if (!pp.hasIva || pp.excluded || pp.Opaque || !vesselEligible || d > RWSettings.maxDistance)
                         continue;
                     if (p.internalModel == null)
                     {
@@ -402,7 +413,7 @@ namespace RealWindows
                 PartPortal pp = pipeline.interiors[i];
                 if (!pp.InteriorUsable)
                     continue;
-                RigidMap own = Alignment.Compute(pp.part.transform, pp.model.transform);
+                RigidMap own = pp.LiveMap();
                 float sm, sd;
                 bool haveStock = Alignment.StockMappingError(pp.part, out sm, out sd);
                 RWLog.Info("  {0} [{1}{2}] dist {3:F1} m, group {4}: stock overlay mapping would be off by {5} ",
@@ -416,7 +427,135 @@ namespace RealWindows
                     pp.probeKey, pp.probe != null && pp.probe.baked, pp.interiorShell.Count, pp.shellRadius,
                     pp.shellCenterLocal.x, pp.shellCenterLocal.y, pp.shellCenterLocal.z);
             }
+            for (int i = 0; i < pipeline.allInteriors.Count; i++)
+                DumpCentrifuge(pipeline.allInteriors[i].part);
             ScreenMessages.PostScreenMessage("RealWindows: alignment written to KSP.log", 2f, ScreenMessageStyle.UPPER_CENTER);
+        }
+
+        // SSPX centrifuges (HabUtils ModuleDeployableCentrifuge, read by reflection):
+        // the ring's spin transform and the interior's rotation root as they are,
+        // and the rotation root that would turn with the ring exactly (the ring's
+        // turn since rest, carried into the interior frame), with the difference.
+        private static void DumpCentrifuge(Part p)
+        {
+            if (p == null || p.internalModel == null)
+                return;
+            PartModule m = null;
+            foreach (PartModule pm in p.Modules)
+                if (pm != null && pm.moduleName == "ModuleDeployableCentrifuge") { m = pm; break; }
+            if (m == null)
+                return;
+            try
+            {
+                const System.Reflection.BindingFlags F = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+                Type t = m.GetType();
+                Func<string, object> get = n => { var f = t.GetField(n, F); return f != null ? f.GetValue(m) : null; };
+                Transform spin = get("spinTransform") as Transform;
+                Transform root = get("IVARotationRoot") as Transform;
+                object rest = get("baseAngles");
+                object rate = get("CurrentSpinRate"), mapping = get("InternalSpinMapping");
+                RWLog.Info("  centrifuge {0}: spin {1}, rate {2}, mapping {3}, IVA rotation root '{4}' (parent '{5}')",
+                    p.partInfo != null ? p.partInfo.name : p.name, spin != null ? spin.name : "null", rate, mapping,
+                    root != null ? root.name : "null", root != null && root.parent != null ? root.parent.name : "-");
+                if (spin == null || root == null || !(rest is Quaternion))
+                    return;
+                Quaternion restQ = (Quaternion)rest;
+                Vector3 se = spin.localEulerAngles, re = root.localEulerAngles;
+                RWLog.Info("    ring local euler ({0:F2}, {1:F2}, {2:F2}), rest euler ({3:F2}, {4:F2}, {5:F2}); root local euler ({6:F2}, {7:F2}, {8:F2}), local pos ({9:F3}, {10:F3}, {11:F3})",
+                    se.x, se.y, se.z, restQ.eulerAngles.x, restQ.eulerAngles.y, restQ.eulerAngles.z,
+                    re.x, re.y, re.z, root.localPosition.x, root.localPosition.y, root.localPosition.z);
+                // the ring's turn since rest: in the part frame, then in the interior frame
+                Quaternion restWorld = (spin.parent != null ? spin.parent.rotation : Quaternion.identity) * restQ;
+                Quaternion dWorld = spin.rotation * Quaternion.Inverse(restWorld);
+                Quaternion dPart = Quaternion.Inverse(p.transform.rotation) * dWorld * p.transform.rotation;
+                Quaternion dInt = Quaternion.Inverse(Alignment.PartToInterior) * dPart * Alignment.PartToInterior;
+                // the root in the interior's frame (through its parents up to the interior)
+                Transform it = p.internalModel.transform;
+                Quaternion actual = Quaternion.Inverse(it.rotation) * root.rotation;
+                float off = Quaternion.Angle(dInt, actual);
+                Quaternion diff = actual * Quaternion.Inverse(dInt);
+                float a; Vector3 axis;
+                diff.ToAngleAxis(out a, out axis);
+                Vector3 ringAxisInt = Quaternion.Inverse(Alignment.PartToInterior) * (Quaternion.Inverse(p.transform.rotation) * spin.forward);
+                RWLog.Info("    ring turned {0:F1} deg since rest; interior root off from it by {1:F1} deg about ({2:F2}, {3:F2}, {4:F2}) (ring axis in the interior frame ({5:F2}, {6:F2}, {7:F2}))",
+                    Quaternion.Angle(Quaternion.identity, dPart), off, axis.x, axis.y, axis.z, ringAxisInt.x, ringAxisInt.y, ringAxisInt.z);
+                RWLog.Info("    other interiors on this part: {0}", OtherInteriors(p));
+
+                // live geometry in the interior frame, as angle around the ring axis and
+                // radius: the ring's bones as deployed, and the interior's seats
+                Vector3 ax = ringAxisInt.normalized;
+                Vector3 u = Vector3.Cross(ax, Mathf.Abs(ax.x) < 0.9f ? Vector3.right : Vector3.up).normalized;
+                Vector3 w = Vector3.Cross(ax, u);
+                Func<Vector3, string> polar = v =>
+                {
+                    Vector3 f = v - ax * Vector3.Dot(v, ax);
+                    float ang = Mathf.Atan2(Vector3.Dot(f, w), Vector3.Dot(f, u)) * Mathf.Rad2Deg;
+                    return string.Format("{0:F0} deg r {1:F1} h {2:F1}", (ang + 360f) % 360f, f.magnitude, Vector3.Dot(v, ax));
+                };
+                Quaternion toInt = Quaternion.Inverse(Alignment.PartToInterior) * Quaternion.Inverse(p.transform.rotation);
+                Vector3 c = toInt * (spin.position - p.transform.position);
+                string bones = "";
+                foreach (Transform b in spin.GetComponentsInChildren<Transform>(true))
+                {
+                    if (b == spin || (b.parent != spin && b.parent.parent != spin))
+                        continue;
+                    Vector3 v = toInt * (b.position - p.transform.position) - c;
+                    Vector3 dir = toInt * b.up;
+                    bones += string.Format("; {0}: {1} (up {2})", b.name, polar(v), polar(dir).Split(' ')[0]);
+                }
+                RWLog.Info("    ring centre in the interior frame ({0:F2}, {1:F2}, {2:F2}); ring children{3}", c.x, c.y, c.z, bones);
+                string seats = "";
+                for (int k = 0; k < p.internalModel.seats.Count; k++)
+                {
+                    InternalSeat st = p.internalModel.seats[k];
+                    if (st == null || st.seatTransform == null)
+                        continue;
+                    Vector3 v = Quaternion.Inverse(it.rotation) * (st.seatTransform.position - it.position) - c;
+                    seats += string.Format("; {0}: {1}", st.seatTransformName, polar(v));
+                }
+                RWLog.Info("    interior seats{0}", seats.Length > 0 ? seats : ": none");
+
+                // what turns with the ring and what doesn't: renderers counted by layer,
+                // whether under the rotation root, enabled and active; the static ones named
+                var groups = new SortedDictionary<string, int>();
+                string still = "";
+                int stillCount = 0;
+                foreach (Renderer rr in p.internalModel.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (rr == null) continue;
+                    bool under = rr.transform.IsChildOf(root);
+                    string key = string.Format("layer {0} {1} {2} {3}", rr.gameObject.layer, under ? "turning" : "STATIC",
+                        rr.enabled ? "enabled" : "disabled", rr.gameObject.activeInHierarchy ? "active" : "inactive");
+                    int cnt;
+                    groups.TryGetValue(key, out cnt);
+                    groups[key] = cnt + 1;
+                    if (!under && rr.GetComponentInParent<Kerbal>() == null && stillCount++ < 12)
+                        still += string.Format("; {0} (under '{1}', layer {2})", rr.name,
+                            rr.transform.parent != null ? rr.transform.parent.name : "-", rr.gameObject.layer);
+                }
+                string g = "";
+                foreach (var kv in groups) g += string.Format("; {0}: {1}", kv.Key, kv.Value);
+                RWLog.Info("    interior renderers{0}", g);
+                RWLog.Info("    static renderers ({0}){1}", stillCount, still.Length > 0 ? still : ": none");
+                foreach (InternalModel om in UnityEngine.Object.FindObjectsOfType<InternalModel>())
+                    if (om != null && om.part == p && om != p.internalModel)
+                        RWLog.Info("    other interior {0}: {1} renderers, active {2}, at {3:F2} m / {4:F1} deg from the main one", om.internalName,
+                            om.GetComponentsInChildren<Renderer>(true).Length, om.gameObject.activeInHierarchy,
+                            (om.transform.position - it.position).magnitude, Quaternion.Angle(om.transform.rotation, it.rotation));
+            }
+            catch (Exception e)
+            {
+                RWLog.Info("    centrifuge dump failed: {0}", e.Message);
+            }
+        }
+
+        private static string OtherInteriors(Part p)
+        {
+            string r = "";
+            foreach (InternalModel im in UnityEngine.Object.FindObjectsOfType<InternalModel>())
+                if (im != null && im.part == p && im != p.internalModel)
+                    r += (r.Length > 0 ? ", " : "") + im.internalName + (im.gameObject.activeInHierarchy ? "" : " (inactive)");
+            return r.Length > 0 ? r : "none";
         }
     }
 }

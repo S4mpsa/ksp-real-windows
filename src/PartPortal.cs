@@ -22,6 +22,8 @@ namespace RealWindows
         public readonly Part part;
         public readonly bool hasIva;     // part config has an INTERNAL
         public readonly bool excluded;
+        public readonly bool rootSpins;  // Kerbalism GravityRing: the whole interior root turns with the ring
+        private readonly ModuleRealWindows toggle; // the part menu's Transparent/Opaque switch, if patched in
 
         // exterior (all parts): drawn into the hull ID pass
         public readonly List<DrawItem> exterior = new List<DrawItem>();
@@ -32,6 +34,13 @@ namespace RealWindows
         public readonly List<Renderer> interiorRenderers = new List<Renderer>();   // every Mesh/Skinned renderer
         public readonly List<Renderer> depthMaskRenderers = new List<Renderer>();  // only depth-mask materials (FreeIva hatch doorways, window plugs)
         public readonly List<DrawItem> interiorShell = new List<DrawItem>();       // opaque, no kerbals or props: front pass and probe bake
+        public readonly List<Renderer> nonKerbalRenderers = new List<Renderer>();  // everything but the crew (shell, props)
+        // motion: an interior whose shell moves (a spinning ring) leaves the cached
+        // layer and is drawn every frame with the kerbals (PortalPipeline)
+        private readonly List<Transform> motionProbe = new List<Transform>();
+        private Vector4 motionSig;
+        private bool motionInit;
+        private float movingUntil;
         public Vector3 shellCenterLocal;  // probe point, interior-local
         public float shellRadius;
         public Bounds shellLocalBounds;   // interior-local box of the shell: "is the camera inside?"
@@ -56,7 +65,33 @@ namespace RealWindows
             ConfigNode ic = p.partInfo != null ? p.partInfo.internalConfig : null;
             hasIva = ic != null && ic.HasValue("name");
             excluded = RWSettings.IsExcluded(p);
+            foreach (PartModule pm in p.Modules)
+            {
+                if (pm == null)
+                    continue;
+                if (pm.moduleName == "GravityRing")
+                    rootSpins = true;
+                if (toggle == null)
+                    toggle = pm as ModuleRealWindows;
+            }
             probeKey = (p.partInfo != null ? p.partInfo.name : p.name) + "|" + (hasIva ? ic.GetValue("name") : "");
+        }
+
+        // The part -> interior map for this frame (Alignment.cs). An interior whose
+        // root spins with the part's ring uses KSP's internal-space map instead, or
+        // its own spin would be cancelled out (it showed standing still).
+        public RigidMap LiveMap()
+        {
+            RigidMap k;
+            if (rootSpins && Alignment.Stock(out k))
+                return k;
+            return Alignment.Compute(part.transform, model.transform);
+        }
+
+        // Switched to "Opaque" in the part menu: windows stay the hull's paint.
+        public bool Opaque
+        {
+            get { return toggle != null && !toggle.transparent; }
         }
 
         public bool InteriorUsable
@@ -276,6 +311,8 @@ namespace RealWindows
                     continue;
                 interiorRenderers.Add(r);
                 bool kerbal = r.GetComponentInParent<Kerbal>() != null;
+                if (!kerbal)
+                    nonKerbalRenderers.Add(r);
                 bool prop = !kerbal && r.GetComponentInParent<InternalProp>() != null;
                 if (!kerbal && shellProbe == null && r is MeshRenderer)
                     shellProbe = r;
@@ -340,6 +377,47 @@ namespace RealWindows
 
         // Only touches the renderers when the state actually changes: in the usual
         // case (one rigid vessel, one render group) nothing changes from frame to frame.
+        // Moved within the last 2 s: its shell (or the root itself, for a ring that
+        // spins its whole interior) moved inside internal space.
+        public bool Moving { get { return Time.unscaledTime < movingUntil; } }
+
+        // Once a frame: a signature of the root's orientation and up to 24 shell
+        // transforms (relative to the root); any change marks the interior moving.
+        public void UpdateMotion(float now)
+        {
+            if (model == null)
+                return;
+            if (motionProbe.Count == 0 && interiorShell.Count > 0)
+            {
+                int step = Math.Max(1, interiorShell.Count / 24);
+                Transform last = null;
+                for (int k = 0; k < interiorShell.Count && motionProbe.Count < 24; k += step)
+                {
+                    Renderer r = interiorShell[k].r;
+                    if (r != null && r.transform != last)
+                        motionProbe.Add(last = r.transform);
+                }
+            }
+            Transform root = model.transform;
+            Vector3 rf = root.forward, ru = root.up;
+            Vector4 s = new Vector4(rf.x + 0.5f * ru.x, rf.y + 0.5f * ru.y, rf.z + 0.5f * ru.z, ru.y - rf.x);
+            for (int k = 0; k < motionProbe.Count; k++)
+            {
+                Transform t = motionProbe[k];
+                if (t == null)
+                    continue;
+                Vector3 pos = root.InverseTransformPoint(t.position);
+                Vector3 fwd = root.InverseTransformDirection(t.forward);
+                Vector3 up = root.InverseTransformDirection(t.up);
+                s += new Vector4(pos.x + fwd.x + 0.5f * up.x, pos.y + fwd.y + 0.5f * up.y, pos.z + fwd.z + 0.5f * up.z,
+                                 (k + 1) * (fwd.x - fwd.z + up.y));
+            }
+            if (motionInit && (s - motionSig).sqrMagnitude > 1e-6f)
+                movingUntil = now + 2f;
+            motionSig = s;
+            motionInit = true;
+        }
+
         public void SetForceOff(bool off)
         {
             if (off == forcedOff)
@@ -362,6 +440,9 @@ namespace RealWindows
             interiorRenderers.Clear();
             depthMaskRenderers.Clear();
             interiorShell.Clear();
+            nonKerbalRenderers.Clear();
+            motionProbe.Clear();
+            motionInit = false;
             shellProbe = null;
             parkedHidden = false;
         }

@@ -18,11 +18,16 @@
   between camera moves; crew still animate every frame. `Alt+F8` switches the
   mod off and on in flight. Expect around 10-15% less FPS with the mod active.
   (The stock "Show Interiors" option is about twice as expensive!)
+- **Per-part switch.** Every part with an interior gets a
+  "Windows: Transparent/Opaque" toggle in its right-click menu.
 
 **Requires** KSP 1.12.x.
-**Optional:** FreeIva.
+
+**Optional:** FreeIva; Module Manager (for the per-part switch).
+
 **Shaders** are included for Windows, macOS and Linux;
 only Windows has been tested in game so far.
+
 **Licence:** GPL v3.
 
 ## How it works

@@ -250,8 +250,12 @@ namespace RealWindows
             }
             RenderTexture.active = prev;
 
+            bool partLit = false;
+            for (int i = 0; i < p.exterior.Count && !partLit; i++)
+                partLit = p.exterior[i].glass != null && p.exterior[i].glass.light != null;
             MaskParams mp = new MaskParams
             {
+                partLit = partLit,
                 seedGloss = (byte)Mathf.Clamp(RWSettings.glassThreshold * 255f, 1f, 255f),
                 seedLight = (byte)Mathf.Clamp(RWSettings.lightThreshold * 255f, 1f, 255f),
                 openEvidence = (byte)Mathf.Clamp(Mathf.Ceil(RWSettings.probeOpenFraction * 255f), 1f, 255f),

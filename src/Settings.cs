@@ -41,6 +41,8 @@ namespace RealWindows
         public static bool kerbalShadows = false;        // shadows in the per-frame kerbals pass (a second shadow pass)
         public static bool renderNeighbours = true;      // interiors of attached parts, seen through open hatches
         public static bool showInteriorWhenInside = true; // camera inside a part: its interior is shown whole
+        public static bool ivaView = true;               // also in IVA: other parts' windows seen through the IVA's windows
+        public static bool centrifugeDeployTwist = false; // untested: SSPX centrifuge module (absent with Kerbalism) whose deploy animation turns the sections: the interior turned with them
         public static bool insideRedraw = true;          // ...drawn again after clouds/atmosphere (they see open sky there)
         public static string insideCompositeEvent = "AfterForwardAlpha";
         public static int maxUvTiles = 16;               // a sub-mesh whose UVs touch more UV tiles than this gets no mask
@@ -138,6 +140,8 @@ namespace RealWindows
                 B(n, "kerbalShadows", ref kerbalShadows);
                 B(n, "renderNeighbours", ref renderNeighbours);
                 B(n, "showInteriorWhenInside", ref showInteriorWhenInside);
+                B(n, "ivaView", ref ivaView);
+                B(n, "centrifugeDeployTwist", ref centrifugeDeployTwist);
                 B(n, "insideRedraw", ref insideRedraw);
                 S(n, "insideCompositeEvent", ref insideCompositeEvent);
                 B(n, "hideDepthMasks", ref hideDepthMasks);
