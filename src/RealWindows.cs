@@ -261,10 +261,10 @@ namespace RealWindows
             if (RWSettings.verboseLogging && now >= nextStatus)
             {
                 nextStatus = now + 30f;
-                RWLog.Info("status: {0} interiors known, {1} rendered in {2} group(s), {3} skipped (no window in view), {4} occluder parts, {5:F2} ms CPU per frame; shell/props cache: {6} redraws, {7} frames reused",
+                RWLog.Info("status: {0} interiors known, {1} rendered in {2} group(s), {3} skipped (no window in view), {4} occluder parts, {5:F2} ms CPU per frame; shell/props cache: {6} redraws, {7} frames reused; window cut-outs in {8} frames",
                     pipeline.allInteriors.Count, pipeline.lastInteriorCount, pipeline.lastGroupCount, pipeline.lastCulled,
-                    pipeline.occluders.Count, pipeline.TakeAverageMs(), pipeline.staticRedraws, pipeline.staticReuses);
-                pipeline.staticRedraws = pipeline.staticReuses = 0;
+                    pipeline.occluders.Count, pipeline.TakeAverageMs(), pipeline.staticRedraws, pipeline.staticReuses, pipeline.holeFrames);
+                pipeline.staticRedraws = pipeline.staticReuses = pipeline.holeFrames = 0;
             }
         }
 

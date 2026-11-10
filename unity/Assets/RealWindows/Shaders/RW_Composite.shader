@@ -16,6 +16,13 @@
 // reflection; smudges cloud it a little; the sun leaves a glint on top. Output is
 // premultiplied (Blend One OneMinusSrcAlpha) so the glint can add light.
 //
+// See-through (_RW_SeeThrough): where a trusted window's view leaves the cabin
+// before meeting an interior surface (out through its far window), the hull layer
+// behind the window (_RW_BehindTex) decides: another part's window drawn in the same
+// interior render shows its interior; behind real transparent glass (reason 4) the
+// scene is left as it is; behind painted glass the window cut-out (RW_Cover) has
+// already let the main render draw the scene there, or the pane stays dark.
+//
 // Pass 1 (camera inside a part, drawn after clouds and atmosphere): only the
 // inside view, everything else left as it is.
 //
@@ -28,78 +35,21 @@ Shader "Hidden/RealWindows/Composite"
     SubShader
     {
         CGINCLUDE
-            #include "UnityCG.cginc"
+            #include "RW_Common.cginc"
 
-            sampler2D _RW_IdTex;
-            sampler2D _RW_FrontTex;
-            sampler2D _RW_InteriorTex;
-            sampler2D _RW_SurfaceTex;
-            float4 _RW_SunColor;
-            float _RW_Reflection;
-            float _RW_Dirt;
-            float4 _RW_IdTex_TexelSize;
-            UNITY_DECLARE_DEPTH_TEXTURE(_CameraDepthTexture);
-
-            float _RW_HullEps;
-            float _RW_SceneEps;
-            float _RW_UseSceneDepth;
-            float _RW_Transmission;
-            float4 _RW_Tint;
-            float _RW_Feather;
-            float _RW_Debug;
-            float _RW_FlipY;
-            float _RW_InsideId;   // the interior the camera is in (0 = none)
-            float _RW_IdGroup[128];   // render group per part id, -1 none
-            float _RW_SeeNeighbours;
-
-            // a and b are the same part, or (seeIntoNeighbours) two parts drawn in
-            // the same interior render, so the colour there really is b's interior
-            bool Matches(float a, float b)
+            bool HasHole(float id)
             {
-                if (abs(a - b) < 0.5) return true;
-                if (_RW_SeeNeighbours < 0.5) return false;
-                int ia = (int)(a + 0.5), ib = (int)(b + 0.5);
-                if (ia <= 0 || ib <= 0 || ia >= 128 || ib >= 128) return false;
-                float ga = _RW_IdGroup[ia], gb = _RW_IdGroup[ib];
-                return ga >= 0 && abs(ga - gb) < 0.5;
+                int i = (int)(id + 0.5);
+                return i > 0 && i < 128 && _RW_HoleIds[i] > 0.5;
             }
 
-            struct v2f
+            // x: window strength, y: interior image weight,
+            // z: cut-out weight (the main render already shows the scene there); dark pane: neither
+            float3 Mask(float2 uv)
             {
-                float4 pos : SV_POSITION;
-                float4 spos : TEXCOORD0;
-            };
-
-            v2f vert(uint id : SV_VertexID)
-            {
-                // one triangle covering the screen
-                float2 t = float2((id << 1) & 2, id & 2);
-                v2f o;
-                o.pos = float4(t * 2.0 - 1.0, 0.5, 1.0);
-                o.spos = ComputeScreenPos(o.pos);
-                return o;
-            }
-
-            // 1 if uv is a window pixel of a rendered part, else 0
-            float Mask(float2 uv)
-            {
-                float3 hull = tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).rgb;
-                float2 front = tex2Dlod(_RW_FrontTex, float4(uv, 0, 0)).rg;
-
-                if (hull.x < 0.5) return 0;                              // not a rendered part
-                if (hull.z < 0.75) return 0;                             // hull point is not a window
-                if (front.x > 0.5 && !Matches(hull.x, front.x)) return 0;   // interior belongs to a part not drawn with this one
-                if (hull.z < 1.5)
-                {
-                    if (front.y <= 0) return 0;                          // no interior along this ray
-                    if (front.y < hull.y - _RW_HullEps) return 0;        // interior pokes out of the hull
-                }
-                if (_RW_UseSceneDepth > 0.5)
-                {
-                    float sd = LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv));
-                    if (sd < hull.y - _RW_SceneEps) return 0;            // something in front (terrain...)
-                }
-                return 1;
+                float4 c = Classify(uv);
+                if (c.z < 0.5) return float3(c.xy, 0);
+                return HasHole(c.w) ? float3(1, 0, 1) : float3(1, 0, 0);
             }
 
             float3 IdColor(float id)
@@ -181,14 +131,17 @@ Shader "Hidden/RealWindows/Composite"
                 if (_RW_Debug < 0.5 && tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).r < 0.5)
                     return float4(0, 0, 0, 0);
 
-                float m = Mask(uv);
+                float3 mk = Mask(uv);
                 if (_RW_Feather > 0)
                 {
                     float2 d = _RW_IdTex_TexelSize.xy * _RW_Feather;
-                    m = (m * 4
+                    mk = (mk * 4
                         + Mask(uv + float2(d.x, 0)) + Mask(uv - float2(d.x, 0))
                         + Mask(uv + float2(0, d.y)) + Mask(uv - float2(0, d.y))) / 8.0;
                 }
+                float m = mk.x;
+                float show = m > 0 ? mk.y / m : 0;
+                float hole = m > 0 ? mk.z / m : 0;
 
                 if (_RW_Debug > 0.5)
                 {
@@ -200,10 +153,13 @@ Shader "Hidden/RealWindows/Composite"
                 if (m <= 0) return float4(0, 0, 0, 0);
                 float4 s = tex2Dlod(_RW_SurfaceTex, float4(uv, 0, 0));
                 float dirt = saturate(s.b * _RW_Dirt);
-                float a = m * _RW_Transmission * (1 - saturate(s.r * _RW_Reflection)) * (1 - dirt * 0.6);
-                float3 interior = tex2Dlod(_RW_InteriorTex, float4(uv, 0, 0)).rgb * _RW_Tint.rgb;
+                float t = _RW_Transmission * (1 - saturate(s.r * _RW_Reflection)) * (1 - dirt * 0.6);
+                float a = m * t;
+                float3 interior = tex2Dlod(_RW_InteriorTex, float4(uv, 0, 0)).rgb * show * _RW_Tint.rgb;
                 float3 glint = _RW_SunColor.rgb * s.g * (1 - dirt * 0.7);
-                return float4(interior * a + glint * m, a);
+                // through a cut-out the scene is already behind: dim it like the interior would be
+                float alpha = m * (t * (1 - hole) + (1 - t) * hole);
+                return float4(interior * a + glint * m, alpha);
             }
         ENDCG
 

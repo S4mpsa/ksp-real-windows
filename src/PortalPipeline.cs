@@ -64,6 +64,22 @@ namespace RealWindows
         private GameObject intCamGO;
 
         private RenderTexture idRT, surfaceRT, frontRT, colorRT;
+        private RenderTexture behindRT;   // the next hull surface behind each window pixel (seeThroughWindows)
+        private bool behindDrawn;
+        // depth cut-outs (seeThroughHoles): per looked-through part, a full-screen triangle
+        // drawn by the main camera just before that part's hull (Renderer.sortingOrder)
+        private Material matCover;
+        private Mesh coverMesh;
+        private readonly List<MeshRenderer> covers = new List<MeshRenderer>();
+        private readonly MaterialPropertyBlock coverBlock = new MaterialPropertyBlock();
+        private readonly List<PartPortal> holeParts = new List<PartPortal>();
+        private readonly float[] holeIds = new float[MaxIds];
+        private readonly List<Renderer> reordered = new List<Renderer>();
+        private readonly List<int> reorderedWas = new List<int>();
+        private readonly HashSet<Renderer> reorderSeen = new HashSet<Renderer>();
+        private bool coversActive;
+        private const int CoverOrderBase = 1000;
+        public int holeFrames;     // for the status line
         // cached internal-space layer: colour + depth, and the per-frame depth copy
         // the kerbals layer is tested and written against
         private RenderTexture staticColorRT, staticDepthRT, dynDepthRT;
@@ -138,6 +154,10 @@ namespace RealWindows
         private static readonly int PID_SourceCount = Shader.PropertyToID("_RW_SourceCount");
         private static readonly int PID_MaskMode = Shader.PropertyToID("_RW_MaskMode");
         private static readonly int PID_MaskTex = Shader.PropertyToID("_RW_MaskTex");
+        private static readonly int PID_Behind = Shader.PropertyToID("_RW_Behind");
+        private static readonly int PID_FrontLayer = Shader.PropertyToID("_RW_FrontLayer");
+        private static readonly int PID_LayerSize = Shader.PropertyToID("_RW_LayerSize");
+        private static readonly int PID_BehindEps = Shader.PropertyToID("_RW_BehindEps");
         public int probesBakedTotal;
 
         public bool Init()
@@ -149,6 +169,8 @@ namespace RealWindows
             matHull = new Material(ShaderBundle.HullShader) { name = "RW hull" };
             matProbe = new Material(ShaderBundle.ProbeShader) { name = "RW probe" };
             matComposite = new Material(ShaderBundle.CompositeShader) { name = "RW composite" };
+            if (ShaderBundle.CoverShader != null)
+                matCover = new Material(ShaderBundle.CoverShader) { name = "RW window cut-out" };
             cbComposite.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3);
             cbInside.DrawProcedural(Matrix4x4.identity, matComposite, 1, MeshTopology.Triangles, 3);
             try { insideEvent = (CameraEvent)Enum.Parse(typeof(CameraEvent), RWSettings.insideCompositeEvent, true); }
@@ -171,12 +193,21 @@ namespace RealWindows
             intCam.renderingPath = rp;
 
             Camera.onPreCull += OnPreCullAny;
+            Camera.onPostRender += OnPostRenderAny;
             return true;
         }
 
         public void Dispose()
         {
             Camera.onPreCull -= OnPreCullAny;
+            Camera.onPostRender -= OnPostRenderAny;
+            DisableCovers();
+            for (int i = 0; i < covers.Count; i++)
+                if (covers[i] != null)
+                    UnityEngine.Object.Destroy(covers[i].gameObject);
+            covers.Clear();
+            if (coverMesh != null) UnityEngine.Object.Destroy(coverMesh);
+            if (matCover != null) UnityEngine.Object.Destroy(matCover);
             Detach();
             DetachInside();
             RestoreDepthMode();
@@ -254,6 +285,7 @@ namespace RealWindows
                 if (cam != main)
                     return;
             }
+            DisableCovers(); // in case the last frame's post-render never came
             rendering = true;
             timer.Reset();
             timer.Start();
@@ -345,65 +377,26 @@ namespace RealWindows
             cbPasses.SetGlobalFloat("_RW_DirtScale", RWSettings.glassDirtScale);
             cbPasses.SetGlobalFloat("_RW_OpenFraction", RWSettings.probeOpenFraction);
             cbPasses.SetGlobalFloat("_RW_WallMargin", RWSettings.probeWallMargin);
-            for (int i = 0; i < occluders.Count; i++)
+            cbPasses.SetGlobalFloat(PID_Behind, 0f);
+            DrawHulls(cropPlanes);
+
+            // 1b. behind layer (seeThroughWindows): the same hulls again, keeping only
+            //     what lies behind a trusted window pixel of the front layer, past the
+            //     window's own part. Where the ray leaves a cabin through its far window,
+            //     the composite looks here: another window drawn in the same interior
+            //     render shows that part's interior, real glass shows the scene, and
+            //     painted glass becomes a cut-out (or stays dark).
+            behindDrawn = RWSettings.seeThroughWindows && behindRT != null;
+            if (behindDrawn)
             {
-                PartPortal p = occluders[i];
-                if (p.part == null)
-                    continue;
-                cbPasses.SetGlobalFloat(PID_PartId, p.frameId);
-                bool confident = p.frameId > 0 && p.HasConfidentWindows;
-                cbPasses.SetGlobalFloat("_RW_SunLit", p.part.vessel != null && p.part.vessel.directSunlight ? 1f : 0f);
-                if (p.frameId > 0 && p.probe != null && p.probe.baked)
-                {
-                    cbPasses.SetGlobalFloat(PID_HasProbe, 1f);
-                    cbPasses.SetGlobalTexture(PID_ProbeTex, p.probe.tex);
-                    cbPasses.SetGlobalMatrix(PID_WorldToProbe, Probes.WorldToProbe(p, p.probe));
-                    cbPasses.SetGlobalVectorArray(PID_Sources, p.probe.sources);
-                    cbPasses.SetGlobalFloat(PID_SourceCount, p.probe.sourceCount);
-                }
-                else
-                {
-                    cbPasses.SetGlobalFloat(PID_HasProbe, 0f);
-                }
-                for (int k = 0; k < p.exterior.Count; k++)
-                {
-                    DrawItem d = p.exterior[k];
-                    Renderer r = d.r;
-                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
-                        continue;
-                    if (!GeometryUtility.TestPlanesAABB(cropPlanes, r.bounds))
-                        continue; // can't cover a window
-                    // 0 probe per pixel, 1 baked mask, 2 the author's glass, 3 solid
-                    float maskMode = 0f;
-                    if (d.solid)
-                    {
-                        maskMode = 3f;
-                    }
-                    else if (d.mask != null && d.mask.named && d.mask.namedRejected)
-                    {
-                        maskMode = 3f; // named like glass, but no opening behind it
-                    }
-                    else if (p.frameId > 0 && d.mask != null && d.mask.named && d.mask.tex != null)
-                    {
-                        maskMode = 1f; // window-named mesh, trimmed to its glass
-                        cbPasses.SetGlobalTexture(PID_MaskTex, d.mask.tex);
-                    }
-                    else if (p.frameId > 0 && d.glass != null && d.glass.channel == 6)
-                    {
-                        maskMode = 2f;
-                    }
-                    else if (p.frameId > 0 && d.mask != null && d.mask.tex != null)
-                    {
-                        maskMode = 1f;
-                        cbPasses.SetGlobalTexture(PID_MaskTex, d.mask.tex);
-                    }
-                    else if (p.frameId > 0 && (d.mask == null || (d.mask.done && d.mask.tex == null)) && confident)
-                    {
-                        maskMode = 3f; // nothing confident here, and the part's windows are known elsewhere: no per-pixel probe
-                    }
-                    cbPasses.SetGlobalFloat(PID_MaskMode, maskMode);
-                    cbPasses.DrawRenderer(r, matHull, d.sub, 0);
-                }
+                cbPasses.SetRenderTarget(behindRT);
+                cbPasses.ClearRenderTarget(true, true, Color.clear, 1f);
+                cbPasses.SetGlobalFloat(PID_Behind, 1f);
+                cbPasses.SetGlobalTexture(PID_FrontLayer, idRT);
+                cbPasses.SetGlobalVector(PID_LayerSize, new Vector4(1f / rtW, 1f / rtH, 0f, 0f));
+                cbPasses.SetGlobalFloat(PID_BehindEps, 0.05f);
+                DrawHulls(cropPlanes);
+                cbPasses.SetGlobalFloat(PID_Behind, 0f);
             }
 
             // 2. interior front surfaces: which part's interior each pixel sees, and how
@@ -424,6 +417,12 @@ namespace RealWindows
                 }
             }
 
+            // composite parameters (the cut-outs use the same window decision)
+            PickHoleParts();
+            SetCompositeParams(matComposite, sun, true);
+            if (matCover != null)
+                SetCompositeParams(matCover, sun, false); // the cut-outs leave things in front to the depth test
+
             Graphics.ExecuteCommandBuffer(cbPasses);
 
             // 3. lit interior colour
@@ -431,24 +430,149 @@ namespace RealWindows
 
             RenderTexture.active = prevActive;
 
-            // 4. composite parameters
-            matComposite.SetTexture("_RW_IdTex", idRT);
-            matComposite.SetTexture("_RW_SurfaceTex", surfaceRT);
+            EnableCovers();
+
+            lastGroupCount = groups.Count;
+            return true;
+        }
+
+        // Parts whose painted windows get depth cut-outs this frame: the rendered ones,
+        // nearest first up to seeThroughHoleParts, then ordered far to near for drawing.
+        private void PickHoleParts()
+        {
+            for (int i = 0; i < holeIds.Length; i++)
+                holeIds[i] = 0f;
+            holeParts.Clear();
+            if (!behindDrawn || !RWSettings.seeThroughHoles || matCover == null || ivaView || insideId > 0)
+                return;
+            for (int g = 0; g < groups.Count; g++)
+                for (int m = 0; m < groups[g].members.Count; m++)
+                {
+                    PartPortal p = groups[g].members[m];
+                    if (p.frameId > 0 && p.frameId < MaxIds && p.part != null)
+                        holeParts.Add(p);
+                }
+            holeParts.Sort((a, b) => a.distance.CompareTo(b.distance));
+            if (holeParts.Count > RWSettings.seeThroughHoleParts)
+                holeParts.RemoveRange(RWSettings.seeThroughHoleParts, holeParts.Count - RWSettings.seeThroughHoleParts);
+            holeParts.Reverse();
+            for (int i = 0; i < holeParts.Count; i++)
+                holeIds[holeParts[i].frameId] = 1f;
+        }
+
+        // Switched on for the main camera's render only (OnPostRenderAny switches them
+        // off): every other renderer keeps its order and comes first; then, far to near,
+        // each part's cut-out and right after it the part's opaque hull renderers.
+        private void EnableCovers()
+        {
+            if (holeParts.Count == 0 || matCover == null)
+                return;
+            if (coverMesh == null)
+            {
+                coverMesh = new Mesh { name = "RW cut-out triangle" };
+                coverMesh.vertices = new[] { new Vector3(-1f, -1f, 0f), new Vector3(3f, -1f, 0f), new Vector3(-1f, 3f, 0f) };
+                coverMesh.triangles = new[] { 0, 1, 2 };
+                coverMesh.bounds = new Bounds(Vector3.zero, Vector3.one * 1e6f);
+            }
+            Vector3 cp = main.transform.position;
+            matCover.SetFloat("_RW_CoverEps", 0.02f);
+            matCover.SetVector("_RW_CoverCam", new Vector4(cp.x, cp.y, cp.z, main.pixelWidth));
+            reorderSeen.Clear();
+            for (int i = 0; i < holeParts.Count; i++)
+            {
+                PartPortal p = holeParts[i];
+                MeshRenderer cr = Cover(i);
+                cr.transform.position = cp;
+                cr.sortingOrder = CoverOrderBase + 2 * i;
+                coverBlock.SetFloat("_RW_CoverId", p.frameId);
+                cr.SetPropertyBlock(coverBlock);
+                cr.enabled = true;
+                for (int k = 0; k < p.exterior.Count; k++)
+                {
+                    Renderer r = p.exterior[k].r;
+                    if (r == null || !reorderSeen.Add(r) || AnyTransparent(r))
+                        continue;
+                    reordered.Add(r);
+                    reorderedWas.Add(r.sortingOrder);
+                    r.sortingOrder = CoverOrderBase + 2 * i + 1;
+                }
+            }
+            coversActive = true;
+            holeFrames++;
+        }
+
+        private MeshRenderer Cover(int i)
+        {
+            while (covers.Count <= i)
+            {
+                GameObject go = new GameObject("RealWindows Cut-out " + covers.Count);
+                go.layer = 0;
+                go.AddComponent<MeshFilter>().sharedMesh = coverMesh;
+                MeshRenderer mr = go.AddComponent<MeshRenderer>();
+                mr.sharedMaterial = matCover;
+                mr.shadowCastingMode = ShadowCastingMode.Off;
+                mr.receiveShadows = false;
+                mr.lightProbeUsage = LightProbeUsage.Off;
+                mr.reflectionProbeUsage = ReflectionProbeUsage.Off;
+                mr.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
+                mr.allowOcclusionWhenDynamic = false;
+                mr.enabled = false;
+                covers.Add(mr);
+            }
+            return covers[i];
+        }
+
+        private static bool AnyTransparent(Renderer r)
+        {
+            Material[] ms = r.sharedMaterials;
+            for (int i = 0; i < ms.Length; i++)
+                if (ms[i] != null && PartPortal.IsTransparent(ms[i]))
+                    return true;
+            return false;
+        }
+
+        private void DisableCovers()
+        {
+            if (!coversActive)
+                return;
+            for (int i = 0; i < covers.Count; i++)
+                if (covers[i] != null)
+                    covers[i].enabled = false;
+            for (int i = 0; i < reordered.Count; i++)
+                if (reordered[i] != null)
+                    reordered[i].sortingOrder = reorderedWas[i];
+            reordered.Clear();
+            reorderedWas.Clear();
+            coversActive = false;
+        }
+
+        private void OnPostRenderAny(Camera cam)
+        {
+            if (cam == main)
+                DisableCovers();
+        }
+
+        private void SetCompositeParams(Material mat, Light sun, bool sceneDepth)
+        {
+            mat.SetTexture("_RW_IdTex", idRT);
+            mat.SetTexture("_RW_SurfaceTex", surfaceRT);
             Color sunColour = sun != null ? sun.color * sun.intensity : Color.white;
-            matComposite.SetColor("_RW_SunColor", sunColour * RWSettings.glassSpecular);
-            matComposite.SetFloat("_RW_Reflection", RWSettings.glassReflection);
-            matComposite.SetFloat("_RW_Dirt", RWSettings.glassDirt);
-            matComposite.SetTexture("_RW_FrontTex", frontRT);
-            matComposite.SetTexture("_RW_InteriorTex", colorRT);
-            matComposite.SetFloat("_RW_HullEps", RWSettings.hullEpsilon);
-            matComposite.SetFloat("_RW_SceneEps", RWSettings.sceneDepthEpsilon);
-            matComposite.SetFloat("_RW_UseSceneDepth", RWSettings.useSceneDepth ? 1f : 0f);
-            matComposite.SetFloat("_RW_Transmission", RWSettings.transmission);
-            matComposite.SetColor("_RW_Tint", RWSettings.glassTint);
-            matComposite.SetFloat("_RW_Feather", RWSettings.feather);
-            matComposite.SetFloat("_RW_Debug", RWSettings.debugMode);
-            matComposite.SetFloat("_RW_FlipY", RWSettings.flipY);
-            matComposite.SetFloat("_RW_InsideId", insideId);
+            mat.SetColor("_RW_SunColor", sunColour * RWSettings.glassSpecular);
+            mat.SetFloat("_RW_Reflection", RWSettings.glassReflection);
+            mat.SetFloat("_RW_Dirt", RWSettings.glassDirt);
+            mat.SetTexture("_RW_FrontTex", frontRT);
+            mat.SetTexture("_RW_BehindTex", behindRT != null ? behindRT : idRT);
+            mat.SetFloat("_RW_SeeThrough", behindDrawn ? 1f : 0f);
+            mat.SetTexture("_RW_InteriorTex", colorRT);
+            mat.SetFloat("_RW_HullEps", RWSettings.hullEpsilon);
+            mat.SetFloat("_RW_SceneEps", RWSettings.sceneDepthEpsilon);
+            mat.SetFloat("_RW_UseSceneDepth", sceneDepth && RWSettings.useSceneDepth ? 1f : 0f);
+            mat.SetFloat("_RW_Transmission", RWSettings.transmission);
+            mat.SetColor("_RW_Tint", RWSettings.glassTint);
+            mat.SetFloat("_RW_Feather", RWSettings.feather);
+            mat.SetFloat("_RW_Debug", RWSettings.debugMode);
+            mat.SetFloat("_RW_FlipY", RWSettings.flipY);
+            mat.SetFloat("_RW_InsideId", insideId);
             for (int i = 0; i < MaxIds; i++)
                 idGroup[i] = -1f;
             for (int g = 0; g < groups.Count; g++)
@@ -458,11 +582,15 @@ namespace RealWindows
                     if (fid > 0 && fid < MaxIds)
                         idGroup[fid] = g;
                 }
-            matComposite.SetFloatArray("_RW_IdGroup", idGroup);
-            matComposite.SetFloat("_RW_SeeNeighbours", RWSettings.seeIntoNeighbours ? 1f : 0f);
-
-            lastGroupCount = groups.Count;
-            return true;
+            mat.SetFloatArray("_RW_IdGroup", idGroup);
+            mat.SetFloat("_RW_SeeNeighbours", RWSettings.seeIntoNeighbours ? 1f : 0f);
+            mat.SetFloatArray("_RW_HoleIds", holeIds);
+            // the colour render's depth (cached shell/props + kerbals), so props and kerbals
+            // in front of a far window keep the interior; only with the split colour pass
+            bool intDepth = RWSettings.interiorRefresh >= 0f && staticColorRT != null && staticDepthRT != null && dynDepthRT != null;
+            mat.SetFloat("_RW_HasInteriorDepth", intDepth ? 1f : 0f);
+            if (dynDepthRT != null)
+                mat.SetTexture("_RW_InteriorDepth", dynDepthRT);
         }
 
         private void BakeNextMask()
@@ -997,6 +1125,69 @@ namespace RealWindows
             depthModeTouched = false;
         }
 
+        // Every occluder's hull sub-meshes into the bound hull targets: part id, eye
+        // depth, window state (+ glass surface on the main pass).
+        private void DrawHulls(Plane[] cropPlanes)
+        {
+            for (int i = 0; i < occluders.Count; i++)
+            {
+                PartPortal p = occluders[i];
+                if (p.part == null)
+                    continue;
+                cbPasses.SetGlobalFloat(PID_PartId, p.frameId);
+                bool confident = p.frameId > 0 && p.HasConfidentWindows;
+                cbPasses.SetGlobalFloat("_RW_SunLit", p.part.vessel != null && p.part.vessel.directSunlight ? 1f : 0f);
+                if (p.frameId > 0 && p.probe != null && p.probe.baked)
+                {
+                    cbPasses.SetGlobalFloat(PID_HasProbe, 1f);
+                    cbPasses.SetGlobalTexture(PID_ProbeTex, p.probe.tex);
+                    cbPasses.SetGlobalMatrix(PID_WorldToProbe, Probes.WorldToProbe(p, p.probe));
+                    cbPasses.SetGlobalVectorArray(PID_Sources, p.probe.sources);
+                    cbPasses.SetGlobalFloat(PID_SourceCount, p.probe.sourceCount);
+                }
+                else
+                {
+                    cbPasses.SetGlobalFloat(PID_HasProbe, 0f);
+                }
+                for (int k = 0; k < p.exterior.Count; k++)
+                {
+                    DrawItem d = p.exterior[k];
+                    Renderer r = d.r;
+                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
+                        continue;
+                    if (!GeometryUtility.TestPlanesAABB(cropPlanes, r.bounds))
+                        continue; // can't cover a window
+                    cbPasses.SetGlobalFloat(PID_MaskMode, HullMode(p, d, confident));
+                    cbPasses.DrawRenderer(r, matHull, d.sub, 0);
+                }
+            }
+        }
+
+        // 0 probe per pixel, 1 baked mask, 2 the author's glass (opaque or unknown),
+        // 3 solid, 4 the author's transparent glass (the scene shows through it).
+        private float HullMode(PartPortal p, DrawItem d, bool confident)
+        {
+            if (d.solid)
+                return 3f;
+            if (d.mask != null && d.mask.named && d.mask.namedRejected)
+                return 3f; // named like glass, but no opening behind it
+            if (p.frameId > 0 && d.mask != null && d.mask.named && d.mask.tex != null)
+            {
+                cbPasses.SetGlobalTexture(PID_MaskTex, d.mask.tex);
+                return 1f; // window-named mesh, trimmed to its glass
+            }
+            if (p.frameId > 0 && d.glass != null && d.glass.channel == 6)
+                return d.glass.named ? 2f : 4f;
+            if (p.frameId > 0 && d.mask != null && d.mask.tex != null)
+            {
+                cbPasses.SetGlobalTexture(PID_MaskTex, d.mask.tex);
+                return 1f;
+            }
+            if (p.frameId > 0 && (d.mask == null || (d.mask.done && d.mask.tex == null)) && confident)
+                return 3f; // nothing confident here, and the part's windows are known elsewhere: no per-pixel probe
+            return 0f;
+        }
+
         private void EnsureRTs(int w, int h, bool hdr)
         {
             if (idRT != null && rtW == w && rtH == h && rtHDR == hdr && idRT.IsCreated())
@@ -1010,6 +1201,7 @@ namespace RealWindows
             idRT = MakeRT("RW hull id+mask", w, h, RenderTextureFormat.ARGBFloat);
             surfaceRT = MakeRT("RW glass surface", w, h, RenderTextureFormat.ARGBHalf, RenderTextureReadWrite.Linear, 0);
             frontRT = MakeRT("RW interior front", w, h, idFmt);
+            behindRT = MakeRT("RW hull behind windows", w, h, RenderTextureFormat.ARGBFloat);
             colorRT = MakeRT("RW interior colour", w, h, hdr ? RenderTextureFormat.DefaultHDR : RenderTextureFormat.Default, RenderTextureReadWrite.Default);
             colorRT.filterMode = FilterMode.Bilinear;
             if (SplitSupported)
@@ -1039,7 +1231,7 @@ namespace RealWindows
 
         private void ReleaseRTs()
         {
-            RenderTexture[] all = { idRT, surfaceRT, frontRT, colorRT, staticColorRT, staticDepthRT, dynDepthRT };
+            RenderTexture[] all = { idRT, surfaceRT, frontRT, behindRT, colorRT, staticColorRT, staticDepthRT, dynDepthRT };
             for (int i = 0; i < all.Length; i++)
             {
                 if (all[i] != null)
@@ -1048,7 +1240,7 @@ namespace RealWindows
                     UnityEngine.Object.Destroy(all[i]);
                 }
             }
-            idRT = surfaceRT = frontRT = colorRT = staticColorRT = staticDepthRT = dynDepthRT = null;
+            idRT = surfaceRT = frontRT = behindRT = colorRT = staticColorRT = staticDepthRT = dynDepthRT = null;
             staticAt = -1f;
         }
     }

@@ -7,7 +7,11 @@
 //   B = 0.5  solid
 //   A = 3 from the mask, 2 candidate region rejected by the IVA, 1 otherwise (debug view 5)
 //
-// _RW_MaskMode: 0 probe per pixel, 1 baked mask, 2 the author's glass, 3 solid (flag decals).
+// _RW_MaskMode: 0 probe per pixel, 1 baked mask, 2 the author's glass, 3 solid (flag decals),
+// 4 the author's transparent glass (written as a trusted window, reason 4).
+// _RW_Behind: 1 draws the layer behind the front layer's trusted windows: fragments are kept
+// only where the front layer (_RW_FrontLayer) is a trusted window of another part, and only
+// past it; everything else is discarded.
 //
 // Pass 1, once per hull texture (HullMasks.cs): draws the sub-mesh flattened
 // into UV space. R = gloss, G = share of view points that see this hull point,
@@ -86,6 +90,10 @@ Shader "Hidden/RealWindows/Hull"
             float _RW_PartId;
             float _RW_HasProbe;
             float _RW_MaskMode;
+            float _RW_Behind;
+            sampler2D _RW_FrontLayer;
+            float4 _RW_LayerSize;   // 1/width, 1/height of the hull targets
+            float _RW_BehindEps;
             float _RW_OpenFraction;
             sampler2D _RW_MaskTex;
             float3 _RW_CamPos;      // world; not _WorldSpaceCameraPos, which command buffers don't set
@@ -180,8 +188,16 @@ Shader "Hidden/RealWindows/Hull"
             {
                 // gradients outside any branch (the mask lookup happens inside one)
                 float2 uvdx = ddx(i.uv), uvdy = ddy(i.uv);
+                if (_RW_Behind > 0.5)
+                {
+                    float4 f = tex2Dlod(_RW_FrontLayer, float4(i.pos.xy * _RW_LayerSize.xy, 0, 0));
+                    if (f.z < 1.5 || abs(f.x - _RW_PartId) < 0.5 || i.eye <= f.y + _RW_BehindEps)
+                        discard;
+                }
                 if (_RW_HasProbe < 0.5)
                     return Out(_RW_PartId, i.eye, 0, 1, i);
+                if (_RW_MaskMode > 3.5)
+                    return Out(_RW_PartId, i.eye, 2, 4, i);
                 if (_RW_MaskMode > 2.5)
                     return Out(_RW_PartId, i.eye, 0.5, 1, i);
                 if (_RW_MaskMode > 1.5)

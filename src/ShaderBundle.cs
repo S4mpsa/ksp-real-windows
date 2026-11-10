@@ -1,4 +1,4 @@
-// Loads the four shaders (id, hull, probe, composite) from the platform asset bundle built by
+// Loads the shaders (id, hull, probe, composite, and the optional window cut-out) from the platform asset bundle built by
 // unity/Assets/Editor/BuildRealWindowsBundle.cs (Unity 2019.4.18f1).
 
 using System;
@@ -13,11 +13,13 @@ namespace RealWindows
         public const string CompositeShaderName = "Hidden/RealWindows/Composite";
         public const string HullShaderName = "Hidden/RealWindows/Hull";
         public const string ProbeShaderName = "Hidden/RealWindows/Probe";
+        public const string CoverShaderName = "Hidden/RealWindows/Cover";   // optional: seeThroughHoles
 
         public static Shader IdShader;
         public static Shader CompositeShader;
         public static Shader HullShader;
         public static Shader ProbeShader;
+        public static Shader CoverShader;
 
         private static bool attempted;
 
@@ -60,6 +62,7 @@ namespace RealWindows
                     else if (shaders[i].name == CompositeShaderName) CompositeShader = shaders[i];
                     else if (shaders[i].name == HullShaderName) HullShader = shaders[i];
                     else if (shaders[i].name == ProbeShaderName) ProbeShader = shaders[i];
+                    else if (shaders[i].name == CoverShaderName) CoverShader = shaders[i];
                 }
                 bundle.Unload(false);
                 if (!Ready)
@@ -75,7 +78,9 @@ namespace RealWindows
                     IdShader = CompositeShader = HullShader = ProbeShader = null;
                     return false;
                 }
-                RWLog.Info("shaders loaded from {0} ({1})", path, SystemInfo.graphicsDeviceType);
+                if (CoverShader != null && !CoverShader.isSupported)
+                    CoverShader = null;
+                RWLog.Info("shaders loaded from {0} ({1}){2}", path, SystemInfo.graphicsDeviceType, CoverShader == null ? ", no window cut-outs" : "");
                 return true;
             }
             catch (Exception e)

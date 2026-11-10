@@ -22,6 +22,7 @@ public static class BuildRealWindowsBundle
         "Assets/RealWindows/Shaders/RW_Composite.shader",
         "Assets/RealWindows/Shaders/RW_Hull.shader",
         "Assets/RealWindows/Shaders/RW_Probe.shader",
+        "Assets/RealWindows/Shaders/RW_Cover.shader",
     };
 
     [MenuItem("RealWindows/Build Shader Bundles")]

@@ -47,6 +47,9 @@ namespace RealWindows
         public static string insideCompositeEvent = "AfterForwardAlpha";
         public static int maxUvTiles = 16;               // a sub-mesh whose UVs touch more UV tiles than this gets no mask
         public static bool seeIntoNeighbours = true;     // a window may show another part's interior drawn in the same render (open hatches)
+        public static bool seeThroughWindows = true;     // where a window's view leaves the cabin, look at the hull behind (another window, the scene through real glass)
+        public static bool seeThroughHoles = true;       // painted windows looked through become depth cut-outs in the main render
+        public static int seeThroughHoleParts = 12;      // ...for at most this many parts (nearest first)
         public static bool hideDepthMasks = true;        // interior depth masks (FreeIva hatch doorways) skipped in our render
 
         // look
@@ -146,6 +149,9 @@ namespace RealWindows
                 S(n, "insideCompositeEvent", ref insideCompositeEvent);
                 B(n, "hideDepthMasks", ref hideDepthMasks);
                 B(n, "seeIntoNeighbours", ref seeIntoNeighbours);
+                B(n, "seeThroughWindows", ref seeThroughWindows);
+                B(n, "seeThroughHoles", ref seeThroughHoles);
+                I(n, "seeThroughHoleParts", ref seeThroughHoleParts);
                 I(n, "maxUvTiles", ref maxUvTiles);
                 F(n, "transmission", ref transmission);
                 F(n, "feather", ref feather);
