@@ -48,7 +48,6 @@ namespace RealWindows
             GameEvents.onVesselCrewWasModified.Add(OnCrewModified);
             GameEvents.onVesselWasModified.Add(OnCrewModified);
             ok = true;
-            CentrifugeTwist.Hook();
             switchedOn = RWSettings.startEnabled;
             RWLog.Info("v{0} active in flight ({1}, toggle key {2})", AssemblyInfo.Version, switchedOn ? "on" : "off", RWSettings.toggleKey);
         }
@@ -59,7 +58,6 @@ namespace RealWindows
             GameEvents.onVesselChange.Remove(OnVesselChanged);
             GameEvents.onVesselCrewWasModified.Remove(OnCrewModified);
             GameEvents.onVesselWasModified.Remove(OnCrewModified);
-            CentrifugeTwist.Unhook();
             if (pipeline != null)
                 pipeline.Dispose();
             pipeline = null;
@@ -243,9 +241,9 @@ namespace RealWindows
             }
 
             RefreshLists(cam, active, now);
-            CentrifugeTwist.Track(pipeline.allInteriors);
             pipeline.UpdateParking();
             pipeline.wantActive = active;
+            pipeline.suspended = false; // switched on: the composite stays attached (see OnPreCullAny)
 
             if (now >= nextPortraits)
             {
@@ -261,10 +259,11 @@ namespace RealWindows
             if (RWSettings.verboseLogging && now >= nextStatus)
             {
                 nextStatus = now + 30f;
-                RWLog.Info("status: {0} interiors known, {1} rendered in {2} group(s), {3} skipped (no window in view), {4} occluder parts, {5:F2} ms CPU per frame; shell/props cache: {6} redraws, {7} frames reused; window cut-outs in {8} frames",
+                RWLog.Info("status: {0} interiors known, {1} rendered in {2} group(s), {3} skipped (no window in view), {4} occluder parts, {5:F2} ms CPU per frame; shell/props cache: {6} redraws, {7} frames reused, kerbals pass skipped in {9} frames (nothing moving); window cut-outs in {8} frames",
                     pipeline.allInteriors.Count, pipeline.lastInteriorCount, pipeline.lastGroupCount, pipeline.lastCulled,
-                    pipeline.occluders.Count, pipeline.TakeAverageMs(), pipeline.staticRedraws, pipeline.staticReuses, pipeline.holeFrames);
-                pipeline.staticRedraws = pipeline.staticReuses = pipeline.holeFrames = 0;
+                    pipeline.occluders.Count, pipeline.TakeAverageMs(), pipeline.staticRedraws, pipeline.staticReuses, pipeline.holeFrames,
+                    pipeline.kerbalSkips);
+                pipeline.staticRedraws = pipeline.staticReuses = pipeline.holeFrames = pipeline.kerbalSkips = 0;
             }
         }
 
@@ -392,7 +391,7 @@ namespace RealWindows
         // debug
         // ------------------------------------------------------------------
 
-        private static readonly string[] DebugNames = { "off", "window mask", "part IDs", "x-ray (alignment check)", "interior only", "window verdict" };
+        private static readonly string[] DebugNames = { "off", "window mask", "part IDs", "x-ray (alignment check)", "interior only", "window verdict", "see-through decision" };
 
         private void HandleKeys()
         {

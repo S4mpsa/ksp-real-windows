@@ -1,5 +1,5 @@
-// Depth cut-outs for painted windows (seeThroughHoles). One full-screen triangle per
-// looked-through part, drawn by the main camera right before that part's hull
+// Depth cut-outs for painted windows (seeThroughWindows). One quad over each
+// looked-through part's window area on screen, drawn by the main camera right before that part's hull
 // (Renderer.sortingOrder: everything else first, then cut-out + hull per part, far
 // to near). Where the window decision (Classify, shared with the composite) says this
 // part's painted window looks out through its far window, it writes depth just in
@@ -22,6 +22,7 @@ Shader "Hidden/RealWindows/Cover"
             float _RW_CoverId;     // this cut-out's part
             float _RW_CoverEps;    // metres in front of the pane
             float4 _RW_CoverCam;   // the main camera's position and pixel width: no cut-outs in any other camera
+            float4 _RW_CoverRect;  // viewport area covered (x0, y0, x1, y1): this part's windows
 
             struct appc
             {
@@ -37,7 +38,10 @@ Shader "Hidden/RealWindows/Cover"
             v2c vertCover(appc v)
             {
                 v2c o;
-                o.pos = float4(v.vertex.xy, 0.5, 1.0);   // already in clip space: covers the screen
+                // unit quad onto the viewport area; clip y follows the target's flip so
+                // ComputeScreenPos gives back the same viewport position
+                float2 v01 = lerp(_RW_CoverRect.xy, _RW_CoverRect.zw, v.vertex.xy);
+                o.pos = float4(v01.x * 2 - 1, (v01.y * 2 - 1) * _ProjectionParams.x, 0.5, 1.0);
                 o.spos = ComputeScreenPos(o.pos);
                 return o;
             }

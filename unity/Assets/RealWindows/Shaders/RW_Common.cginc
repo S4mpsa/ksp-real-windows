@@ -27,7 +27,7 @@ float _RW_FlipY;
 float _RW_InsideId;   // the interior the camera is in (0 = none)
 float _RW_IdGroup[128];   // render group per part id, -1 none
 float _RW_SeeNeighbours;
-float _RW_HoleIds[128];   // 1 for parts whose painted windows get depth cut-outs (seeThroughHoles)
+float _RW_HoleIds[128];   // 1 for parts whose painted windows get depth cut-outs (seeThroughWindows)
 UNITY_DECLARE_DEPTH_TEXTURE(_RW_InteriorDepth);   // depth of the whole interior render: shell, props, kerbals
 float _RW_HasInteriorDepth;
 
@@ -49,12 +49,16 @@ struct v2f
     float4 spos : TEXCOORD0;
 };
 
+float4 _RW_DrawRect;   // viewport area drawn (x0, y0, x1, y1): the windows' area, or the whole screen
+
 v2f vert(uint id : SV_VertexID)
 {
-    // one triangle covering the screen
-    float2 t = float2((id << 1) & 2, id & 2);
+    // two triangles (6 vertices) over the drawn area; clip y follows the target's
+    // flip so ComputeScreenPos gives back the same viewport position
+    float2 t = float2(id == 1 || id == 4 || id == 5 ? 1.0 : 0.0, id == 2 || id == 3 || id == 5 ? 1.0 : 0.0);
+    float2 v01 = lerp(_RW_DrawRect.xy, _RW_DrawRect.zw, t);
     v2f o;
-    o.pos = float4(t * 2.0 - 1.0, 0.5, 1.0);
+    o.pos = float4(v01.x * 2.0 - 1.0, (v01.y * 2.0 - 1.0) * _ProjectionParams.x, 0.5, 1.0);
     o.spos = ComputeScreenPos(o.pos);
     return o;
 }
@@ -77,8 +81,14 @@ float InteriorEye(float2 uv)
 // y: 1 to show the interior image there
 // z: 1 where painted glass needs the scene behind it (out through the far window)
 // w: the part id
-float4 Classify(float2 uv)
+// br: which rule decided (debug view 6): 0 not a window, 1 scene in front,
+//     2 interior: colour-render depth (props, kerbals), 3 interior: shell surface,
+//     4 another part's interior not drawn with this one, 5 another window in the
+//     same render, 6 real glass (scene as it is), 7 painted glass (needs the scene),
+//     8 interior (no see-through test), 9 no interior behind (probe window)
+float4 ClassifyEx(float2 uv, out float br)
 {
+    br = 0;
     float4 hull = tex2Dlod(_RW_IdTex, float4(uv, 0, 0));
     float2 front = tex2Dlod(_RW_FrontTex, float4(uv, 0, 0)).rg;
 
@@ -87,7 +97,7 @@ float4 Classify(float2 uv)
     if (_RW_UseSceneDepth > 0.5)
     {
         float sd = LinearEyeDepth(SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv));
-        if (sd < hull.y - _RW_SceneEps) return 0;            // something in front (terrain...)
+        if (sd < hull.y - _RW_SceneEps) { br = 1; return 0; }   // something in front (terrain...)
     }
     if (hull.z > 1.5 && _RW_SeeThrough > 0.5)
     {
@@ -96,21 +106,39 @@ float4 Classify(float2 uv)
         // (and of the next hull) keeps the interior there
         float ie = InteriorEye(uv);
         if (ie > 0 && (b.y <= 0 || ie <= b.y + _RW_HullEps) && (front.y <= 0 || ie < front.y - _RW_HullEps))
+        {
+            br = 2;
             return float4(1, 1, 0, hull.x);
+        }
         if (front.y > 0 && (b.y <= 0 || front.y <= b.y + _RW_HullEps))
-            return Matches(hull.x, front.x) ? float4(1, 1, 0, hull.x) : 0;   // an interior surface comes first
+        {
+            bool own = Matches(hull.x, front.x);
+            br = own ? 3 : 4;
+            return own ? float4(1, 1, 0, hull.x) : 0;        // an interior surface comes first
+        }
         // out through the far window: another window drawn in the same render shows its interior
         if (b.x > 0.5 && b.z > 0.75 && front.y > 0 && Matches(hull.x, b.x) && Matches(b.x, front.x)
             && front.y >= b.y - _RW_HullEps)
+        {
+            br = 5;
             return float4(1, 1, 0, hull.x);
+        }
+        br = hull.w > 3.5 ? 6 : 7;
         return hull.w > 3.5 ? 0 : float4(1, 0, 1, hull.x);  // real glass: the scene is already there; painted: needs it
     }
-    if (front.x > 0.5 && !Matches(hull.x, front.x)) return 0;   // interior belongs to a part not drawn with this one
+    if (front.x > 0.5 && !Matches(hull.x, front.x)) { br = 4; return 0; }   // interior belongs to a part not drawn with this one
     if (hull.z < 1.5)
     {
-        if (front.y <= 0) return 0;                          // no interior along this ray
-        if (front.y < hull.y - _RW_HullEps) return 0;        // interior pokes out of the hull
+        if (front.y <= 0) { br = 9; return 0; }              // no interior along this ray
+        if (front.y < hull.y - _RW_HullEps) { br = 9; return 0; }   // interior pokes out of the hull
     }
+    br = 8;
     return float4(1, 1, 0, hull.x);
+}
+
+float4 Classify(float2 uv)
+{
+    float br;
+    return ClassifyEx(uv, br);
 }
 #endif

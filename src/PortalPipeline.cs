@@ -66,7 +66,7 @@ namespace RealWindows
         private RenderTexture idRT, surfaceRT, frontRT, colorRT;
         private RenderTexture behindRT;   // the next hull surface behind each window pixel (seeThroughWindows)
         private bool behindDrawn;
-        // depth cut-outs (seeThroughHoles): per looked-through part, a full-screen triangle
+        // depth cut-outs (seeThroughWindows): per looked-through part, a quad over its windows
         // drawn by the main camera just before that part's hull (Renderer.sortingOrder)
         private Material matCover;
         private Mesh coverMesh;
@@ -90,6 +90,8 @@ namespace RealWindows
         private readonly List<Vector3> staticPos = new List<Vector3>();
         private readonly List<Quaternion> staticRot = new List<Quaternion>();
         public int staticRedraws, staticReuses;   // for the status line
+        public int kerbalSkips;                   // frames whose kerbals pass was skipped (nothing moving), for the status line
+        private RenderTexture interiorTex, interiorDepthTex;   // what the composite reads this frame: the cache itself, or cache + kerbals
         private const int LayerKerbals = 16, LayerInternal = 20;
         private readonly RenderTargetIdentifier[] hullTargets = new RenderTargetIdentifier[2];
         private int rtW, rtH;
@@ -116,6 +118,12 @@ namespace RealWindows
         private readonly float[] idGroup = new float[MaxIds];
         private DepthTextureMode originalDepthMode;
         private bool depthModeTouched;
+        // Other mods may change the flight camera on a camera switch (IVA and back):
+        // the depth-texture flag the window test needs, or our command buffers.
+        // Checked after every switch and every few seconds, repaired, and logged once.
+        private bool cameraSwitched;
+        private float nextCameraCheck;
+        private bool warnedDepth, warnedBuffer;
 
         private readonly List<PortalGroup> groups = new List<PortalGroup>();
         private readonly Stack<PortalGroup> groupPool = new Stack<PortalGroup>();
@@ -158,6 +166,10 @@ namespace RealWindows
         private static readonly int PID_FrontLayer = Shader.PropertyToID("_RW_FrontLayer");
         private static readonly int PID_LayerSize = Shader.PropertyToID("_RW_LayerSize");
         private static readonly int PID_BehindEps = Shader.PropertyToID("_RW_BehindEps");
+        private static readonly int PID_DrawRect = Shader.PropertyToID("_RW_DrawRect");
+        // switched off (toggle key / startEnabled): nothing attached; cleared each
+        // frame by the addon while switched on
+        public bool suspended = true;
         public int probesBakedTotal;
 
         public bool Init()
@@ -171,8 +183,19 @@ namespace RealWindows
             matComposite = new Material(ShaderBundle.CompositeShader) { name = "RW composite" };
             if (ShaderBundle.CoverShader != null)
                 matCover = new Material(ShaderBundle.CoverShader) { name = "RW window cut-out" };
-            cbComposite.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 3);
-            cbInside.DrawProcedural(Matrix4x4.identity, matComposite, 1, MeshTopology.Triangles, 3);
+            // Bind the camera's own target first: a buffer that runs before ours on the
+            // same event may leave something else bound. Cinematic Shaders' GTAO ends in
+            // a native plugin event that binds its own targets behind Unity's back; once
+            // our composite ran after it (re-attached after IVA and back), it drew into
+            // GTAO's texture and every window lost its interior.
+            if (RWSettings.bindCameraTarget)
+            {
+                cbComposite.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                cbInside.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+            }
+            // a quad over _RW_DrawRect (the windows' area, set every frame)
+            cbComposite.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 6);
+            cbInside.DrawProcedural(Matrix4x4.identity, matComposite, 1, MeshTopology.Triangles, 6);
             try { insideEvent = (CameraEvent)Enum.Parse(typeof(CameraEvent), RWSettings.insideCompositeEvent, true); }
             catch (Exception) { insideEvent = CameraEvent.AfterForwardAlpha; }
 
@@ -194,6 +217,19 @@ namespace RealWindows
 
             Camera.onPreCull += OnPreCullAny;
             Camera.onPostRender += OnPostRenderAny;
+            GameEvents.OnCameraChange.Add(OnCameraChange);
+
+            // Attach now, before other mods add theirs once the scene is up (Cinematic
+            // Shaders turns GTAO on at onLevelWasLoadedGUIReady): first in line on the
+            // event, drawing nothing until there is something to draw.
+            matComposite.SetVector(PID_DrawRect, Vector4.zero);
+            if (RWSettings.startEnabled && FlightCamera.fetch != null && FlightCamera.fetch.mainCamera != null)
+            {
+                main = FlightCamera.fetch.mainCamera;
+                suspended = false;
+                Attach();
+                AttachInside();
+            }
             return true;
         }
 
@@ -201,6 +237,7 @@ namespace RealWindows
         {
             Camera.onPreCull -= OnPreCullAny;
             Camera.onPostRender -= OnPostRenderAny;
+            GameEvents.OnCameraChange.Remove(OnCameraChange);
             DisableCovers();
             for (int i = 0; i < covers.Count; i++)
                 if (covers[i] != null)
@@ -235,6 +272,7 @@ namespace RealWindows
         public void Suspend()
         {
             wantActive = false;
+            suspended = true;
             Detach();
             DetachInside();
             RestoreDepthMode();
@@ -305,10 +343,30 @@ namespace RealWindows
                 timeSum += timer.Elapsed.TotalMilliseconds;
                 timeFrames++;
             }
-            if (renderedThisFrame) Attach(); else Detach();
-            if (renderedThisFrame && insideId > 0) AttachInside(); else DetachInside();
+            if (cameraSwitched || Time.unscaledTime >= nextCameraCheck)
+                CheckCamera();
+            // Attached from the first frame and kept attached while switched on, so the
+            // buffers keep their place among other mods' buffers on the same event: a
+            // re-attach puts them last, after steps that can leave Unity's cached
+            // render state wrong (Cinematic Shaders' GTAO, a native plugin step at
+            // AfterForwardOpaque, after which the composite read the wrong inputs and
+            // drew nothing). With nothing to draw, the quad is empty.
             if (!renderedThisFrame)
+            {
+                if (matComposite != null)
+                    matComposite.SetVector(PID_DrawRect, Vector4.zero);
                 staticAt = -1f; // whatever is cached may be out of date by the next render
+            }
+            if (suspended)
+            {
+                Detach();
+                DetachInside();
+            }
+            else
+            {
+                Attach();
+                AttachInside();
+            }
         }
 
         private bool RenderPasses()
@@ -378,7 +436,14 @@ namespace RealWindows
             cbPasses.SetGlobalFloat("_RW_OpenFraction", RWSettings.probeOpenFraction);
             cbPasses.SetGlobalFloat("_RW_WallMargin", RWSettings.probeWallMargin);
             cbPasses.SetGlobalFloat(PID_Behind, 0f);
+            // only the windows' area can matter: everything outside stays cleared
+            Rect scissor = new Rect(Mathf.Floor(wr.xMin * rtW), Mathf.Floor(wr.yMin * rtH), 0f, 0f);
+            scissor.xMax = Mathf.Ceil(wr.xMax * rtW);
+            scissor.yMax = Mathf.Ceil(wr.yMax * rtH);
+            bool useScissor = RWSettings.scissorPasses && RWSettings.debugMode == 0 && (scissor.width < rtW || scissor.height < rtH);
+            if (useScissor) cbPasses.EnableScissorRect(scissor);
             DrawHulls(cropPlanes);
+            if (useScissor) cbPasses.DisableScissorRect();
 
             // 1b. behind layer (seeThroughWindows): the same hulls again, keeping only
             //     what lies behind a trusted window pixel of the front layer, past the
@@ -395,7 +460,9 @@ namespace RealWindows
                 cbPasses.SetGlobalTexture(PID_FrontLayer, idRT);
                 cbPasses.SetGlobalVector(PID_LayerSize, new Vector4(1f / rtW, 1f / rtH, 0f, 0f));
                 cbPasses.SetGlobalFloat(PID_BehindEps, 0.05f);
+                if (useScissor) cbPasses.EnableScissorRect(scissor);
                 DrawHulls(cropPlanes);
+                if (useScissor) cbPasses.DisableScissorRect();
                 cbPasses.SetGlobalFloat(PID_Behind, 0f);
             }
 
@@ -403,6 +470,7 @@ namespace RealWindows
             //    deep. The shell answers that; props and kerbals add only draw calls.
             cbPasses.SetRenderTarget(frontRT);
             cbPasses.ClearRenderTarget(true, true, Color.clear, 1f);
+            if (useScissor) cbPasses.EnableScissorRect(scissor);
             for (int g = 0; g < groups.Count; g++)
             {
                 PortalGroup grp = groups[g];
@@ -416,6 +484,7 @@ namespace RealWindows
                     DrawList(p.interiorShell, matCullBack, p.StockHidden);
                 }
             }
+            if (useScissor) cbPasses.DisableScissorRect();
 
             // composite parameters (the cut-outs use the same window decision)
             PickHoleParts();
@@ -427,6 +496,8 @@ namespace RealWindows
 
             // 3. lit interior colour
             RenderInteriorColour();
+            BindInterior(matComposite);
+            BindInterior(matCover);
 
             RenderTexture.active = prevActive;
 
@@ -443,7 +514,7 @@ namespace RealWindows
             for (int i = 0; i < holeIds.Length; i++)
                 holeIds[i] = 0f;
             holeParts.Clear();
-            if (!behindDrawn || !RWSettings.seeThroughHoles || matCover == null || ivaView || insideId > 0)
+            if (!behindDrawn || matCover == null || ivaView || insideId > 0)
                 return;
             for (int g = 0; g < groups.Count; g++)
                 for (int m = 0; m < groups[g].members.Count; m++)
@@ -469,9 +540,10 @@ namespace RealWindows
                 return;
             if (coverMesh == null)
             {
-                coverMesh = new Mesh { name = "RW cut-out triangle" };
-                coverMesh.vertices = new[] { new Vector3(-1f, -1f, 0f), new Vector3(3f, -1f, 0f), new Vector3(-1f, 3f, 0f) };
-                coverMesh.triangles = new[] { 0, 1, 2 };
+                // a unit quad; the shader stretches it over the part's window area
+                coverMesh = new Mesh { name = "RW cut-out quad" };
+                coverMesh.vertices = new[] { new Vector3(0f, 0f, 0f), new Vector3(1f, 0f, 0f), new Vector3(0f, 1f, 0f), new Vector3(1f, 1f, 0f) };
+                coverMesh.triangles = new[] { 0, 2, 1, 1, 2, 3 };
                 coverMesh.bounds = new Bounds(Vector3.zero, Vector3.one * 1e6f);
             }
             Vector3 cp = main.transform.position;
@@ -485,6 +557,7 @@ namespace RealWindows
                 cr.transform.position = cp;
                 cr.sortingOrder = CoverOrderBase + 2 * i;
                 coverBlock.SetFloat("_RW_CoverId", p.frameId);
+                coverBlock.SetVector("_RW_CoverRect", PadRect(p.screenArea));
                 cr.SetPropertyBlock(coverBlock);
                 cr.enabled = true;
                 for (int k = 0; k < p.exterior.Count; k++)
@@ -499,6 +572,14 @@ namespace RealWindows
             }
             coversActive = true;
             holeFrames++;
+        }
+
+        // Viewport rect (x0, y0, x1, y1) grown by the feather and a couple of pixels.
+        private Vector4 PadRect(Rect r)
+        {
+            float px = 2f * Mathf.Max(1f, RWSettings.feather) + 2f;
+            float dx = px / Mathf.Max(1, main.pixelWidth), dy = px / Mathf.Max(1, main.pixelHeight);
+            return new Vector4(Mathf.Clamp01(r.xMin - dx), Mathf.Clamp01(r.yMin - dy), Mathf.Clamp01(r.xMax + dx), Mathf.Clamp01(r.yMax + dy));
         }
 
         private MeshRenderer Cover(int i)
@@ -563,7 +644,6 @@ namespace RealWindows
             mat.SetTexture("_RW_FrontTex", frontRT);
             mat.SetTexture("_RW_BehindTex", behindRT != null ? behindRT : idRT);
             mat.SetFloat("_RW_SeeThrough", behindDrawn ? 1f : 0f);
-            mat.SetTexture("_RW_InteriorTex", colorRT);
             mat.SetFloat("_RW_HullEps", RWSettings.hullEpsilon);
             mat.SetFloat("_RW_SceneEps", RWSettings.sceneDepthEpsilon);
             mat.SetFloat("_RW_UseSceneDepth", sceneDepth && RWSettings.useSceneDepth ? 1f : 0f);
@@ -573,6 +653,11 @@ namespace RealWindows
             mat.SetFloat("_RW_Debug", RWSettings.debugMode);
             mat.SetFloat("_RW_FlipY", RWSettings.flipY);
             mat.SetFloat("_RW_InsideId", insideId);
+            // windowRect is already padded by the feather; the debug views and the
+            // inside view need the whole screen
+            mat.SetVector(PID_DrawRect, RWSettings.debugMode > 0 || insideId > 0
+                ? new Vector4(0f, 0f, 1f, 1f)
+                : new Vector4(windowRect.xMin, windowRect.yMin, windowRect.xMax, windowRect.yMax));
             for (int i = 0; i < MaxIds; i++)
                 idGroup[i] = -1f;
             for (int g = 0; g < groups.Count; g++)
@@ -589,8 +674,7 @@ namespace RealWindows
             // in front of a far window keep the interior; only with the split colour pass
             bool intDepth = RWSettings.interiorRefresh >= 0f && staticColorRT != null && staticDepthRT != null && dynDepthRT != null;
             mat.SetFloat("_RW_HasInteriorDepth", intDepth ? 1f : 0f);
-            if (dynDepthRT != null)
-                mat.SetTexture("_RW_InteriorDepth", dynDepthRT);
+            // _RW_InteriorTex / _RW_InteriorDepth: BindInterior, once the colour pass has run
         }
 
         private void BakeNextMask()
@@ -620,13 +704,23 @@ namespace RealWindows
         // Depth masks write depth but no colour: FreeIva's hatch doorways and window
         // plugs are meant for a viewer in IVA and would hide whatever lies behind them
         // (the next part through an open hatch, kerbals walking through it).
+        // The IVA's own window glass likewise: some of it writes depth (stock
+        // KSP/Alpha/Translucent, the Mk1 cockpit's canopy), so the window decision took
+        // it for a wall in front of the far window, and from outside it only doubled
+        // the composite's glass (and tinted the far view dark).
         private void HideMasks(PartPortal p)
         {
-            if (!RWSettings.hideDepthMasks)
-                return;
-            for (int k = 0; k < p.depthMaskRenderers.Count; k++)
+            if (RWSettings.hideDepthMasks)
+                HideAll(p.depthMaskRenderers);
+            if (RWSettings.hideInteriorGlass)
+                HideAll(p.glassRenderers);
+        }
+
+        private void HideAll(List<Renderer> list)
+        {
+            for (int k = 0; k < list.Count; k++)
             {
-                Renderer r = p.depthMaskRenderers[k];
+                Renderer r = list[k];
                 if (r != null && !r.forceRenderingOff)
                 {
                     r.forceRenderingOff = true;
@@ -766,6 +860,9 @@ namespace RealWindows
                 if (!haveRect) { windowRect = area; haveRect = true; }
                 else windowRect = Rect.MinMaxRect(Mathf.Min(windowRect.xMin, area.xMin), Mathf.Min(windowRect.yMin, area.yMin),
                                                    Mathf.Max(windowRect.xMax, area.xMax), Mathf.Max(windowRect.yMax, area.yMax));
+                p.screenArea = area;
+                p.UpdateDetail(p == insidePart ? float.MaxValue
+                    : Mathf.Max(area.width * main.pixelWidth, area.height * main.pixelHeight));
                 p.map = p.LiveMap();
                 p.frameId = ++id;
                 lastInteriorCount++;
@@ -843,15 +940,29 @@ namespace RealWindows
                 {
                     staticReuses++;
                 }
-                Graphics.CopyTexture(staticColorRT, colorRT);
-                Graphics.CopyTexture(staticDepthRT, dynDepthRT);
-                if (!RWSettings.kerbalShadows)
-                    QualitySettings.shadows = ShadowQuality.Disable;
-                RenderGroups(ColourPass.Kerbals);
+                if (NeedKerbalPass())
+                {
+                    Graphics.CopyTexture(staticColorRT, colorRT);
+                    Graphics.CopyTexture(staticDepthRT, dynDepthRT);
+                    if (!RWSettings.kerbalShadows)
+                        QualitySettings.shadows = ShadowQuality.Disable;
+                    RenderGroups(ColourPass.Kerbals);
+                    interiorTex = colorRT;
+                    interiorDepthTex = dynDepthRT;
+                }
+                else
+                {
+                    // nothing moves in there: the cache is the picture (no copies, no render)
+                    interiorTex = staticColorRT;
+                    interiorDepthTex = staticDepthRT;
+                    kerbalSkips++;
+                }
             }
             else
             {
                 RenderGroups(ColourPass.All);
+                interiorTex = colorRT;
+                interiorDepthTex = dynDepthRT;
             }
             intCam.targetTexture = null;
 
@@ -891,21 +1002,7 @@ namespace RealWindows
             for (int g = 0; g < groups.Count; g++)
             {
                 PortalGroup grp = groups[g];
-                // Neighbours of the group's parts on the same vessel: not rendered for
-                // their own windows, but seen through open hatches from a rendered part.
-                context.Clear();
-                if (RWSettings.renderNeighbours)
-                {
-                    for (int m = 0; m < grp.members.Count; m++)
-                    {
-                        Part mp = grp.members[m].part;
-                        AddNeighbour(mp.parent, g, grp);
-                        for (int c = 0; c < mp.children.Count; c++)
-                            AddNeighbour(mp.children[c], g, grp);
-                        for (int a = 0; a < mp.attachNodes.Count; a++)
-                            AddNeighbour(mp.attachNodes[a].attachedPart, g, grp);
-                    }
-                }
+                BuildContext(g);
                 // only this group's interiors and their neighbours (SetForceOff skips unchanged
                 // ones). Parked interiors (other vessels, hidden from the stock cameras) are
                 // switched on for their own render and parked again afterwards.
@@ -957,6 +1054,21 @@ namespace RealWindows
                     HideMasks(q);
                 }
 
+                // detail by the windows' size on screen; neighbours (seen through a
+                // hatch) follow the most detailed member of the group
+                bool grpProps = false, grpCrew = false, cachedCrew = false;
+                for (int m = 0; m < grp.members.Count; m++)
+                {
+                    grpProps |= grp.members[m].propsOn;
+                    grpCrew |= grp.members[m].crewOn;
+                }
+                for (int m = 0; m < grp.members.Count; m++)
+                    ApplyDetail(grp.members[m], grp.members[m].propsOn, grp.members[m].crewOn, pass, ref cachedCrew);
+                foreach (PartPortal q in context)
+                    ApplyDetail(q, grpProps, grpCrew, pass, ref cachedCrew);
+                if (pass == ColourPass.Static)
+                    intCam.cullingMask = cachedCrew ? (1 << LayerInternal) | (1 << LayerKerbals) : 1 << LayerInternal;
+
                 intCam.transform.SetPositionAndRotation(grp.map.Apply(camT.position), grp.map.Apply(camT.rotation));
                 // the first render of the frame clears; the kerbals pass draws over the copied cache
                 intCam.clearFlags = g == 0 && pass != ColourPass.Kerbals ? CameraClearFlags.SolidColor : CameraClearFlags.Nothing;
@@ -990,6 +1102,84 @@ namespace RealWindows
                         staticHidden[k].forceRenderingOff = false;
                 staticHidden.Clear();
             }
+        }
+
+        // Props of interiors whose windows are small on screen stay out of every render.
+        // Their crew is drawn into the cached image instead of every frame: in the
+        // Static pass (which then also takes the kerbals layer) while the crew of the
+        // detailed interiors is hidden there, and hidden in the per-frame pass. Moving
+        // interiors aren't in the cache, so their crew stays live.
+        private void ApplyDetail(PartPortal q, bool props, bool crew, ColourPass pass, ref bool cachedCrew)
+        {
+            if (!props)
+                HideAll(q.propRenderers);
+            if (pass == ColourPass.Static)
+            {
+                if (crew)
+                    HideAll(q.kerbalRenderers);
+                else if (q.HasKerbals && !q.Moving)
+                    cachedCrew = true;
+            }
+            else if (pass == ColourPass.Kerbals && !crew && !q.Moving)
+            {
+                HideAll(q.kerbalRenderers);
+            }
+        }
+
+        // Neighbours of group g's parts on the same vessel (into `context`): not rendered
+        // for their own windows, but seen through open hatches from a rendered part.
+        private void BuildContext(int g)
+        {
+            context.Clear();
+            if (!RWSettings.renderNeighbours)
+                return;
+            PortalGroup grp = groups[g];
+            for (int m = 0; m < grp.members.Count; m++)
+            {
+                Part mp = grp.members[m].part;
+                AddNeighbour(mp.parent, g, grp);
+                for (int c = 0; c < mp.children.Count; c++)
+                    AddNeighbour(mp.children[c], g, grp);
+                for (int a = 0; a < mp.attachNodes.Count; a++)
+                    AddNeighbour(mp.attachNodes[a].attachedPart, g, grp);
+            }
+        }
+
+        // The per-frame kerbals pass is only needed when something drawn moves: crew
+        // in any interior drawn this frame (neighbours too), a moving interior (spinning
+        // ring), or another mod's stand-ins (API subscribers). Otherwise the cached
+        // shell/props image is the whole picture and is used as it is. Crew of
+        // interiors with small windows is in that image (ApplyDetail) and doesn't count.
+        private bool NeedKerbalPass()
+        {
+            if (RealWindowsApi.HasSubscribers)
+                return true;
+            for (int g = 0; g < groups.Count; g++)
+            {
+                List<PartPortal> ms = groups[g].members;
+                bool grpCrew = false;
+                for (int m = 0; m < ms.Count; m++)
+                {
+                    grpCrew |= ms[m].crewOn;
+                    if ((ms[m].HasKerbals && ms[m].crewOn) || ms[m].Moving)
+                        return true;
+                }
+                BuildContext(g);
+                foreach (PartPortal q in context)
+                    if ((q.HasKerbals && grpCrew) || q.Moving)
+                        return true;
+            }
+            return false;
+        }
+
+        // The interior image and depth the composite and cut-outs read this frame.
+        private void BindInterior(Material mat)
+        {
+            if (mat == null)
+                return;
+            mat.SetTexture("_RW_InteriorTex", interiorTex != null ? interiorTex : colorRT);
+            if (interiorDepthTex != null)
+                mat.SetTexture("_RW_InteriorDepth", interiorDepthTex);
         }
 
         // The cached layer is redrawn when anything that shapes its picture
@@ -1053,7 +1243,8 @@ namespace RealWindows
                     h = h * 31 + g;
                     List<PartPortal> ms = groups[g].members;
                     for (int m = 0; m < ms.Count; m++)
-                        h = h * 31 + (ms[m].model != null ? ms[m].model.GetInstanceID() : 0);
+                        h = (h * 31 + (ms[m].model != null ? ms[m].model.GetInstanceID() : 0)) * 4
+                            + (ms[m].propsOn ? 1 : 0) + (ms[m].crewOn ? 2 : 0);   // detail changes what the cache holds
                 }
                 for (int i = 0; i < allInteriors.Count; i++)
                     h = h * 31 + (allInteriors[i].model != null ? allInteriors[i].model.GetInstanceID() : 0) * 2
@@ -1066,19 +1257,86 @@ namespace RealWindows
         // composite attach / RTs
         // ------------------------------------------------------------------
 
+        private void OnCameraChange(CameraManager.CameraMode mode)
+        {
+            cameraSwitched = true;
+        }
+
+        // The window test compares each hull pixel with the scene depth
+        // (_CameraDepthTexture). Deferred rendering always makes that texture; forward
+        // only while a camera flag asks for it, so a mod clearing the flag left every
+        // window failing the test in forward, while the inside view (no scene depth)
+        // still worked. Likewise a mod removing our command buffer left the composite
+        // off for good, since it was only added again after a detach.
+        private void CheckCamera()
+        {
+            bool switched = cameraSwitched;
+            cameraSwitched = false;
+            nextCameraCheck = Time.unscaledTime + 2f;
+            if (main == null)
+                return;
+            bool depthLost = depthModeTouched && (main.depthTextureMode & DepthTextureMode.Depth) == 0;
+            bool bufferLost = (compositeAttached && !HasBuffer(compositeCamera, compositeEvent, cbComposite))
+                              || (insideAttached && !HasBuffer(insideCamera, insideEvent, cbInside));
+            if (switched || depthLost || bufferLost)
+                RWLog.Verbose("camera {0}: {1} rendering, depth texture {2}, HDR {3}, composite {4}",
+                    CameraManager.Instance != null ? CameraManager.Instance.currentCameraMode.ToString() : "?",
+                    main.actualRenderingPath, main.depthTextureMode, main.allowHDR,
+                    !compositeAttached ? "detached" : bufferLost ? "removed by another mod" : "attached");
+            if (depthLost && !warnedDepth)
+            {
+                warnedDepth = true;
+                RWLog.Warn("another mod cleared the flight camera's depth texture flag ({0} rendering); set again", main.actualRenderingPath);
+            }
+            if (bufferLost && !warnedBuffer)
+            {
+                warnedBuffer = true;
+                RWLog.Warn("another mod removed Real Windows' command buffer from the flight camera; added again");
+            }
+            if (bufferLost)
+            {
+                // attached again below, this frame (last in line: only when it was gone)
+                Detach();
+                DetachInside();
+            }
+            if (switched || bufferLost)
+                staticAt = -1f;
+        }
+
+        private static bool HasBuffer(Camera cam, CameraEvent evt, CommandBuffer cb)
+        {
+            if (cam == null)
+                return false;
+            // Unity hands back new wrapper objects, never the one added: compare names
+            CommandBuffer[] bufs = cam.GetCommandBuffers(evt);
+            for (int i = 0; i < bufs.Length; i++)
+                if (bufs[i] != null && bufs[i].name == cb.name)
+                    return true;
+            return false;
+        }
+
+        // Asked for every frame: only a cheap flag check once set.
+        private void EnsureDepthMode()
+        {
+            if (!RWSettings.useSceneDepth || main == null)
+                return;
+            if (!depthModeTouched)
+            {
+                originalDepthMode = main.depthTextureMode;
+                depthModeTouched = true;
+            }
+            if ((main.depthTextureMode & DepthTextureMode.Depth) == 0)
+                main.depthTextureMode |= DepthTextureMode.Depth;
+        }
+
         private void Attach()
         {
+            EnsureDepthMode();
             if (compositeAttached && compositeCamera == main)
                 return;
             Detach();
             if (main == null)
                 return;
-            if (RWSettings.useSceneDepth && !depthModeTouched)
-            {
-                originalDepthMode = main.depthTextureMode;
-                main.depthTextureMode |= DepthTextureMode.Depth;
-                depthModeTouched = true;
-            }
             main.AddCommandBuffer(compositeEvent, cbComposite);
             compositeCamera = main;
             compositeAttached = true;
@@ -1120,8 +1378,9 @@ namespace RealWindows
 
         private void RestoreDepthMode()
         {
-            if (depthModeTouched && main != null)
-                main.depthTextureMode = originalDepthMode;
+            // take back only our flag: whatever other mods set since stays
+            if (depthModeTouched && main != null && (originalDepthMode & DepthTextureMode.Depth) == 0)
+                main.depthTextureMode &= ~DepthTextureMode.Depth;
             depthModeTouched = false;
         }
 
@@ -1190,7 +1449,11 @@ namespace RealWindows
 
         private void EnsureRTs(int w, int h, bool hdr)
         {
-            if (idRT != null && rtW == w && rtH == h && rtHDR == hdr && idRT.IsCreated())
+            // the interior image (colour and depth) can be smaller than the screen
+            // (interiorScale); window outlines come from the full-size id passes
+            float scale = Mathf.Clamp(RWSettings.interiorScale, 0.1f, 1f);
+            int iw = Mathf.Max(16, Mathf.RoundToInt(w * scale)), ih = Mathf.Max(16, Mathf.RoundToInt(h * scale));
+            if (idRT != null && rtW == w && rtH == h && rtHDR == hdr && idRT.IsCreated() && colorRT != null && colorRT.width == iw && colorRT.height == ih)
                 return;
             ReleaseRTs();
             rtW = w;
@@ -1202,15 +1465,16 @@ namespace RealWindows
             surfaceRT = MakeRT("RW glass surface", w, h, RenderTextureFormat.ARGBHalf, RenderTextureReadWrite.Linear, 0);
             frontRT = MakeRT("RW interior front", w, h, idFmt);
             behindRT = MakeRT("RW hull behind windows", w, h, RenderTextureFormat.ARGBFloat);
-            colorRT = MakeRT("RW interior colour", w, h, hdr ? RenderTextureFormat.DefaultHDR : RenderTextureFormat.Default, RenderTextureReadWrite.Default);
+            colorRT = MakeRT("RW interior colour", iw, ih, hdr ? RenderTextureFormat.DefaultHDR : RenderTextureFormat.Default, RenderTextureReadWrite.Default);
             colorRT.filterMode = FilterMode.Bilinear;
             if (SplitSupported)
             {
-                staticColorRT = MakeRT("RW interior static colour", w, h, colorRT.format, RenderTextureReadWrite.Default, 0);
-                staticDepthRT = MakeRT("RW interior static depth", w, h, RenderTextureFormat.Depth, RenderTextureReadWrite.Linear, 24);
-                dynDepthRT = MakeRT("RW interior kerbal depth", w, h, RenderTextureFormat.Depth, RenderTextureReadWrite.Linear, 24);
+                staticColorRT = MakeRT("RW interior static colour", iw, ih, colorRT.format, RenderTextureReadWrite.Default, 0);
+                staticColorRT.filterMode = FilterMode.Bilinear; // read directly when no kerbals pass runs
+                staticDepthRT = MakeRT("RW interior static depth", iw, ih, RenderTextureFormat.Depth, RenderTextureReadWrite.Linear, 24);
+                dynDepthRT = MakeRT("RW interior kerbal depth", iw, ih, RenderTextureFormat.Depth, RenderTextureReadWrite.Linear, 24);
             }
-            RWLog.Info("render targets {0}x{1} (hdr={2}, id format {3})", w, h, hdr, idFmt);
+            RWLog.Info("render targets {0}x{1}, interior {2}x{3} (hdr={4}, id format {5})", w, h, iw, ih, hdr, idFmt);
         }
 
         private static RenderTexture MakeRT(string name, int w, int h, RenderTextureFormat fmt,
@@ -1241,6 +1505,7 @@ namespace RealWindows
                 }
             }
             idRT = surfaceRT = frontRT = behindRT = colorRT = staticColorRT = staticDepthRT = dynDepthRT = null;
+            interiorTex = interiorDepthTex = null;
             staticAt = -1f;
         }
     }

@@ -1,5 +1,7 @@
 // Settings: GameData/RealWindows/settings.cfg
-// Every key is optional; missing keys keep the defaults below.
+// Every key is optional; missing keys keep the defaults below. The shipped file
+// lists only the player-facing ones; the rest (pipeline internals, detection
+// tuning, developer diagnostics) are still read when a line is added by hand.
 
 using System;
 using System.Collections.Generic;
@@ -42,15 +44,19 @@ namespace RealWindows
         public static bool renderNeighbours = true;      // interiors of attached parts, seen through open hatches
         public static bool showInteriorWhenInside = true; // camera inside a part: its interior is shown whole
         public static bool ivaView = true;               // also in IVA: other parts' windows seen through the IVA's windows
-        public static bool centrifugeDeployTwist = false; // untested: SSPX centrifuge module (absent with Kerbalism) whose deploy animation turns the sections: the interior turned with them
         public static bool insideRedraw = true;          // ...drawn again after clouds/atmosphere (they see open sky there)
         public static string insideCompositeEvent = "AfterForwardAlpha";
         public static int maxUvTiles = 16;               // a sub-mesh whose UVs touch more UV tiles than this gets no mask
         public static bool seeIntoNeighbours = true;     // a window may show another part's interior drawn in the same render (open hatches)
-        public static bool seeThroughWindows = true;     // where a window's view leaves the cabin, look at the hull behind (another window, the scene through real glass)
-        public static bool seeThroughHoles = true;       // painted windows looked through become depth cut-outs in the main render
+        public static bool seeThroughWindows = true;     // where a window's view leaves the cabin, look at the hull behind (another window, the scene through real glass, cut-outs in painted glass)
         public static int seeThroughHoleParts = 12;      // ...for at most this many parts (nearest first)
         public static bool hideDepthMasks = true;        // interior depth masks (FreeIva hatch doorways) skipped in our render
+        public static bool hideInteriorGlass = true;     // the IVA's own transparent window glass skipped in our render
+        public static bool scissorPasses = true;         // id/depth passes drawn only over the windows' screen area
+        public static bool bindCameraTarget = true;      // the composite binds the camera's target itself (another buffer before it may leave its own bound)
+        public static float interiorScale = 1f;          // interior image resolution relative to the screen (0.1-1)
+        public static float propDetailPixels = 160f;     // props drawn while the windows are at least this big on screen (px, largest side; 0 = always)
+        public static float crewDetailPixels = 48f;      // crew animated every frame from this size; smaller, it is cached with the cabin (0 = always)
 
         // look
         public static float transmission = 0.85f;
@@ -144,13 +150,17 @@ namespace RealWindows
                 B(n, "renderNeighbours", ref renderNeighbours);
                 B(n, "showInteriorWhenInside", ref showInteriorWhenInside);
                 B(n, "ivaView", ref ivaView);
-                B(n, "centrifugeDeployTwist", ref centrifugeDeployTwist);
                 B(n, "insideRedraw", ref insideRedraw);
                 S(n, "insideCompositeEvent", ref insideCompositeEvent);
                 B(n, "hideDepthMasks", ref hideDepthMasks);
+                B(n, "hideInteriorGlass", ref hideInteriorGlass);
+                B(n, "scissorPasses", ref scissorPasses);
+                B(n, "bindCameraTarget", ref bindCameraTarget);
+                F(n, "interiorScale", ref interiorScale);
+                F(n, "propDetailPixels", ref propDetailPixels);
+                F(n, "crewDetailPixels", ref crewDetailPixels);
                 B(n, "seeIntoNeighbours", ref seeIntoNeighbours);
                 B(n, "seeThroughWindows", ref seeThroughWindows);
-                B(n, "seeThroughHoles", ref seeThroughHoles);
                 I(n, "seeThroughHoleParts", ref seeThroughHoleParts);
                 I(n, "maxUvTiles", ref maxUvTiles);
                 F(n, "transmission", ref transmission);

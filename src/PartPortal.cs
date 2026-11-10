@@ -33,6 +33,9 @@ namespace RealWindows
         public InternalModel model;      // reference the caches below belong to
         public readonly List<Renderer> interiorRenderers = new List<Renderer>();   // every Mesh/Skinned renderer
         public readonly List<Renderer> depthMaskRenderers = new List<Renderer>();  // only depth-mask materials (FreeIva hatch doorways, window plugs)
+        public readonly List<Renderer> glassRenderers = new List<Renderer>();      // only transparent (and depth-mask) materials, not props or kerbals: the IVA's window glass
+        public readonly List<Renderer> propRenderers = new List<Renderer>();       // props (InternalProp), left out while the windows are small on screen
+        public readonly List<Renderer> kerbalRenderers = new List<Renderer>();     // crew, cached instead of drawn every frame while the windows are small
         public readonly List<DrawItem> interiorShell = new List<DrawItem>();       // opaque, no kerbals or props: front pass and probe bake
         public readonly List<Renderer> nonKerbalRenderers = new List<Renderer>();  // everything but the crew (shell, props)
         // motion: an interior whose shell moves (a spinning ring) leaves the cached
@@ -56,7 +59,34 @@ namespace RealWindows
         public RigidMap map;
         public int group;
         public float distance;
+        public Rect screenArea;          // viewport area of its windows (whole screen when the camera is inside)
         public bool parkedHidden;        // forceRenderingOff held outside our passes
+
+        // crew (or anything else on the kerbals layer) in the interior: drawn every frame
+        public bool HasKerbals
+        {
+            get { return interiorRenderers.Count > nonKerbalRenderers.Count; }
+        }
+
+        // Detail by the windows' size on screen (largest side, px): props are drawn
+        // from propDetailPixels up, crew animated every frame from crewDetailPixels up
+        // (below that it is drawn into the cached image, refreshed with it). Switched
+        // back off only at 3/4 of the threshold, so it doesn't flicker at the edge.
+        public bool propsOn = true, crewOn = true;
+
+        public void UpdateDetail(float px)
+        {
+            propsOn = Above(px, RWSettings.propDetailPixels, propsOn);
+            // another mod's stand-ins (API) are drawn in the per-frame pass only
+            crewOn = RealWindowsApi.HasSubscribers || Above(px, RWSettings.crewDetailPixels, crewOn);
+        }
+
+        private static bool Above(float px, float limit, bool was)
+        {
+            if (limit <= 0f)
+                return true;
+            return px >= (was ? limit * 0.75f : limit);
+        }
         public ProbeData probe;
 
         public PartPortal(Part p)
@@ -314,6 +344,10 @@ namespace RealWindows
                 if (!kerbal)
                     nonKerbalRenderers.Add(r);
                 bool prop = !kerbal && r.GetComponentInParent<InternalProp>() != null;
+                if (kerbal)
+                    kerbalRenderers.Add(r);
+                else if (prop)
+                    propRenderers.Add(r);
                 if (!kerbal && shellProbe == null && r is MeshRenderer)
                     shellProbe = r;
                 int subs = SubMeshCount(r);
@@ -329,6 +363,8 @@ namespace RealWindows
                 }
                 if (allMasks)
                     depthMaskRenderers.Add(r);
+                else if (!kerbal && !prop && AllGlass(mats))
+                    glassRenderers.Add(r);
                 for (int s = 0; s < subs && s < mats.Length; s++)
                 {
                     Material m = mats[s];
@@ -439,6 +475,9 @@ namespace RealWindows
             SetForceOff(false);
             interiorRenderers.Clear();
             depthMaskRenderers.Clear();
+            glassRenderers.Clear();
+            propRenderers.Clear();
+            kerbalRenderers.Clear();
             interiorShell.Clear();
             nonKerbalRenderers.Clear();
             motionProbe.Clear();
@@ -503,6 +542,24 @@ namespace RealWindows
                 || n.IndexOf("/Alpha/", StringComparison.OrdinalIgnoreCase) >= 0
                 || n.IndexOf("Particle", StringComparison.OrdinalIgnoreCase) >= 0
                 || n.IndexOf("Additive", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Window glass modelled in the IVA: every material transparent (FreeIva moves
+        // these into the opaque queue and, with Deferred, adds a depth mask, so the
+        // shader name decides), at least one not a depth mask.
+        private static bool AllGlass(Material[] mats)
+        {
+            bool any = false;
+            for (int i = 0; i < mats.Length; i++)
+            {
+                Material m = mats[i];
+                if (m == null || IsDepthMask(m))
+                    continue;
+                if (!IsTransparent(m))
+                    return false;
+                any = true;
+            }
+            return any;
         }
 
         public static bool IsDepthMask(Material m)

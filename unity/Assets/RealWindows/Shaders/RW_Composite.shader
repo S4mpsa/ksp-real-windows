@@ -52,6 +52,15 @@ Shader "Hidden/RealWindows/Composite"
                 return HasHole(c.w) ? float3(1, 0, 1) : float3(1, 0, 0);
             }
 
+            // What the window decision mostly turns on, from two reads: the hull part,
+            // its window state (none / probe / trusted) and the interior part seen.
+            float3 Sig(float2 uv)
+            {
+                float3 hull = tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).rgb;
+                float fr = tex2Dlod(_RW_FrontTex, float4(uv, 0, 0)).r;
+                return float3(hull.x, step(0.75, hull.z) + step(1.5, hull.z), fr);
+            }
+
             float3 IdColor(float id)
             {
                 if (id < 0.5) return float3(0, 0, 0);
@@ -105,6 +114,24 @@ Shader "Hidden/RealWindows/Composite"
                     float3 c = tex2Dlod(_RW_InteriorTex, float4(uv, 0, 0)).rgb;
                     return PM(float4(c, same ? 0.75 : 0));
                 }
+                if (_RW_Debug > 5.5)
+                {
+                    // see-through decision per window pixel (ClassifyEx's rule)
+                    float br;
+                    float4 c = ClassifyEx(uv, br);
+                    int r = (int)(br + 0.5);
+                    if (r == 0) return float4(0, 0, 0, 0);
+                    float3 col = r == 1 ? float3(0.5, 0.5, 0.5)       // scene in front: grey
+                               : r == 2 ? float3(1, 0.55, 0)          // interior by colour-render depth: orange
+                               : r == 3 ? float3(0.1, 1, 0.2)         // interior shell surface: green
+                               : r == 4 ? float3(1, 0, 0)             // another part's interior, not drawn with it: red
+                               : r == 5 ? float3(0, 1, 1)             // another window in the same render: cyan
+                               : r == 6 ? float3(0.2, 0.4, 1)         // real glass, scene as it is: blue
+                               : r == 7 ? (HasHole(c.w) ? float3(1, 0, 1) : float3(0.4, 0, 0.4))  // cut-out: magenta / none: dark purple
+                               : r == 8 ? float3(0.6, 1, 0.1)         // interior, no see-through test: lime
+                               :          float3(1, 1, 0);            // probe window, no interior behind: yellow
+                    return PM(float4(col, 0.6));
+                }
                 if (_RW_Debug > 4.5)
                 {
                     // verdict per hull pixel; clear = no probe
@@ -134,10 +161,20 @@ Shader "Hidden/RealWindows/Composite"
                 float3 mk = Mask(uv);
                 if (_RW_Feather > 0)
                 {
+                    // The five-tap softening only changes anything where the taps
+                    // disagree: at the window outline, or where the view inside
+                    // switches between interiors / a cut-out. Two cheap reads per
+                    // neighbour find those pixels; only there the full decision runs
+                    // four more times. Inside a pane all taps agree and the centre
+                    // result stands (same as the average of five equal taps).
                     float2 d = _RW_IdTex_TexelSize.xy * _RW_Feather;
-                    mk = (mk * 4
-                        + Mask(uv + float2(d.x, 0)) + Mask(uv - float2(d.x, 0))
-                        + Mask(uv + float2(0, d.y)) + Mask(uv - float2(0, d.y))) / 8.0;
+                    float3 s0 = Sig(uv);
+                    bool edge = any(Sig(uv + float2(d.x, 0)) != s0) || any(Sig(uv - float2(d.x, 0)) != s0)
+                             || any(Sig(uv + float2(0, d.y)) != s0) || any(Sig(uv - float2(0, d.y)) != s0);
+                    if (edge)
+                        mk = (mk * 4
+                            + Mask(uv + float2(d.x, 0)) + Mask(uv - float2(d.x, 0))
+                            + Mask(uv + float2(0, d.y)) + Mask(uv - float2(0, d.y))) / 8.0;
                 }
                 float m = mk.x;
                 float show = m > 0 ? mk.y / m : 0;

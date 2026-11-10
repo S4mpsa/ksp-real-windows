@@ -13,7 +13,7 @@ namespace RealWindows
         public const string CompositeShaderName = "Hidden/RealWindows/Composite";
         public const string HullShaderName = "Hidden/RealWindows/Hull";
         public const string ProbeShaderName = "Hidden/RealWindows/Probe";
-        public const string CoverShaderName = "Hidden/RealWindows/Cover";   // optional: seeThroughHoles
+        public const string CoverShaderName = "Hidden/RealWindows/Cover";   // optional: the cut-outs of seeThroughWindows
 
         public static Shader IdShader;
         public static Shader CompositeShader;
