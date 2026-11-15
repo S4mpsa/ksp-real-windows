@@ -36,10 +36,12 @@ namespace RealWindows
             kerbal.InPart = null;
             kerbal.SetVisibleInPortrait(false);
             kerbal.state = Kerbal.States.NO_SIGNAL;
-            for (int i = KerbalPortraitGallery.Instance.ActiveCrew.Count - 1; i >= 0; i--)
+            // the obsolete ActiveCrew returns a copy: remove from the gallery's own list
+            var items = KerbalPortraitGallery.Instance.ActiveCrewItems;
+            for (int i = items.Count - 1; i >= 0; i--)
             {
-                if (KerbalPortraitGallery.Instance.ActiveCrew[i].crewMemberName == kerbal.crewMemberName)
-                    KerbalPortraitGallery.Instance.ActiveCrew.RemoveAt(i);
+                if (items[i].kerbal == kerbal)
+                    items.RemoveAt(i);
             }
             KerbalPortraitGallery.Instance.DespawnInactivePortraits();
             KerbalPortraitGallery.Instance.DespawnPortrait(kerbal);
