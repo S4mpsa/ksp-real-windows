@@ -26,10 +26,18 @@
 // Pass 1 (camera inside a part, drawn after clouds and atmosphere): only the
 // inside view, everything else left as it is.
 //
+// Pass 2 (true holes, _RW_LateHoles, seeThroughDepth): the glass of the cut-outs
+// alone, drawn after sky, atmosphere and clouds. With true holes those are drawn
+// into the cut-outs after pass 0 ran, and would cover a pane laid there; so pass 0
+// leaves the cut-outs' share out and this pass adds it once they are done. The two
+// shares add up to exactly what pass 0 draws on its own without true holes.
+//
 // _RW_Debug: 5 window verdict (lime window from the mask or author's glass / green window from
 //            the probe / cyan candidate region rejected, no IVA opening / blue solid)
 // _RW_Debug: 0 normal, 1 window mask (yellow shown / red hull-only), 2 part ids, 3 x-ray (interior wherever
 // the part matches - alignment check), 4 interior colour only.
+// _RW_Debug: 7 (pass 2) the scene depth texture at window pixels, as later effects read it: grey something
+//            in front of the pane / red the pane itself / green something behind it / blue the far plane.
 Shader "Hidden/RealWindows/Composite"
 {
     SubShader
@@ -96,10 +104,85 @@ Shader "Hidden/RealWindows/Composite"
                 return Inside(uv, c) ? c : float4(0, 0, 0, 0);
             }
 
+            float _RW_LateHoles;   // 1: true holes this frame, the cut-outs' glass is pass 2's
+
+            // The window weights of Mask, softened over the outline.
+            float3 Feathered(float2 uv)
+            {
+                float3 mk = Mask(uv);
+                if (_RW_Feather > 0)
+                {
+                    // The five-tap softening only changes anything where the taps
+                    // disagree: at the window outline, or where the view inside
+                    // switches between interiors / a cut-out. Two cheap reads per
+                    // neighbour find those pixels; only there the full decision runs
+                    // four more times. Inside a pane all taps agree and the centre
+                    // result stands (same as the average of five equal taps).
+                    float2 d = _RW_IdTex_TexelSize.xy * _RW_Feather;
+                    float3 s0 = Sig(uv);
+                    bool edge = any(Sig(uv + float2(d.x, 0)) != s0) || any(Sig(uv - float2(d.x, 0)) != s0)
+                             || any(Sig(uv + float2(0, d.y)) != s0) || any(Sig(uv - float2(0, d.y)) != s0);
+                    if (edge)
+                        mk = (mk * 4
+                            + Mask(uv + float2(d.x, 0)) + Mask(uv - float2(d.x, 0))
+                            + Mask(uv + float2(0, d.y)) + Mask(uv - float2(0, d.y))) / 8.0;
+                }
+                return mk;
+            }
+
+            // The composite's output (premultiplied) in two shares that add up to it:
+            // win, the windows showing an interior or a dark pane, and hol, the
+            // cut-outs, where the scene behind is already on screen and only dimmed.
+            void Glass(float2 uv, float3 mk, out float4 win, out float4 hol)
+            {
+                float m = mk.x;
+                float show = m > 0 ? mk.y / m : 0;
+                float hole = m > 0 ? mk.z / m : 0;
+                float4 s = tex2Dlod(_RW_SurfaceTex, float4(uv, 0, 0));
+                float dirt = saturate(s.b * _RW_Dirt);
+                float t = _RW_Transmission * (1 - saturate(s.r * _RW_Reflection)) * (1 - dirt * 0.6);
+                float3 interior = tex2Dlod(_RW_InteriorTex, float4(uv, 0, 0)).rgb * show * _RW_Tint.rgb;
+                float3 glint = _RW_SunColor.rgb * s.g * (1 - dirt * 0.7);
+                // through a cut-out the scene is already behind: dim it like the interior would be
+                win = float4((interior * t + glint * (1 - hole)) * m, m * t * (1 - hole));
+                hol = float4(glint * hole * m, m * (1 - t) * hole);
+            }
+
+            float4 fragHoles(v2f i) : SV_Target
+            {
+                float2 uv = i.spos.xy / i.spos.w;
+                if (_RW_FlipY > 0.5) uv.y = 1 - uv.y;
+
+                if (_RW_Debug > 6.5)
+                {
+                    float4 h = tex2Dlod(_RW_IdTex, float4(uv, 0, 0));
+                    if (h.x < 0.5 || h.z < 0.75) return float4(0, 0, 0, 0);
+                    float raw = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, uv);
+                    float sd = LinearEyeDepth(raw);
+                    float3 col = Linear01Depth(raw) > 0.999 ? float3(0.1, 0.3, 1)        // far plane: blue
+                               : sd < h.y - _RW_SceneEps ? float3(0.5, 0.5, 0.5)         // in front of the pane: grey
+                               : sd < h.y + 0.5 ? float3(1, 0.1, 0.1)                    // the pane: red
+                               :                  float3(0.1, 1, 0.2);                   // behind it: green
+                    return PM(float4(col, 0.75));
+                }
+                if (_RW_LateHoles < 0.5 || _RW_Debug > 0.5)
+                    return float4(0, 0, 0, 0);
+                if (tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).r < 0.5)
+                    return float4(0, 0, 0, 0);
+                float3 mk = Feathered(uv);
+                if (mk.x <= 0 || mk.z <= 0) return float4(0, 0, 0, 0);
+                float4 win, hol;
+                Glass(uv, mk, win, hol);
+                return hol;
+            }
+
             float4 frag(v2f i) : SV_Target
             {
                 float2 uv = i.spos.xy / i.spos.w;
                 if (_RW_FlipY > 0.5) uv.y = 1 - uv.y;
+
+                if (_RW_Debug > 6.5)
+                    return float4(0, 0, 0, 0);   // pass 2's view
 
                 if (_RW_Debug > 1.5 && _RW_Debug < 2.5)
                 {
@@ -158,27 +241,8 @@ Shader "Hidden/RealWindows/Composite"
                 if (_RW_Debug < 0.5 && tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).r < 0.5)
                     return float4(0, 0, 0, 0);
 
-                float3 mk = Mask(uv);
-                if (_RW_Feather > 0)
-                {
-                    // The five-tap softening only changes anything where the taps
-                    // disagree: at the window outline, or where the view inside
-                    // switches between interiors / a cut-out. Two cheap reads per
-                    // neighbour find those pixels; only there the full decision runs
-                    // four more times. Inside a pane all taps agree and the centre
-                    // result stands (same as the average of five equal taps).
-                    float2 d = _RW_IdTex_TexelSize.xy * _RW_Feather;
-                    float3 s0 = Sig(uv);
-                    bool edge = any(Sig(uv + float2(d.x, 0)) != s0) || any(Sig(uv - float2(d.x, 0)) != s0)
-                             || any(Sig(uv + float2(0, d.y)) != s0) || any(Sig(uv - float2(0, d.y)) != s0);
-                    if (edge)
-                        mk = (mk * 4
-                            + Mask(uv + float2(d.x, 0)) + Mask(uv - float2(d.x, 0))
-                            + Mask(uv + float2(0, d.y)) + Mask(uv - float2(0, d.y))) / 8.0;
-                }
+                float3 mk = Feathered(uv);
                 float m = mk.x;
-                float show = m > 0 ? mk.y / m : 0;
-                float hole = m > 0 ? mk.z / m : 0;
 
                 if (_RW_Debug > 0.5)
                 {
@@ -188,15 +252,9 @@ Shader "Hidden/RealWindows/Composite"
                 }
 
                 if (m <= 0) return float4(0, 0, 0, 0);
-                float4 s = tex2Dlod(_RW_SurfaceTex, float4(uv, 0, 0));
-                float dirt = saturate(s.b * _RW_Dirt);
-                float t = _RW_Transmission * (1 - saturate(s.r * _RW_Reflection)) * (1 - dirt * 0.6);
-                float a = m * t;
-                float3 interior = tex2Dlod(_RW_InteriorTex, float4(uv, 0, 0)).rgb * show * _RW_Tint.rgb;
-                float3 glint = _RW_SunColor.rgb * s.g * (1 - dirt * 0.7);
-                // through a cut-out the scene is already behind: dim it like the interior would be
-                float alpha = m * (t * (1 - hole) + (1 - t) * hole);
-                return float4(interior * a + glint * m, alpha);
+                float4 win, hol;
+                Glass(uv, mk, win, hol);
+                return _RW_LateHoles > 0.5 ? win : win + hol;
             }
         ENDCG
 
@@ -224,6 +282,20 @@ Shader "Hidden/RealWindows/Composite"
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment fragInside
+            #pragma target 3.5
+            ENDCG
+        }
+
+        Pass
+        {
+            ZTest Always
+            ZWrite Off
+            Cull Off
+            Blend One OneMinusSrcAlpha
+
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment fragHoles
             #pragma target 3.5
             ENDCG
         }

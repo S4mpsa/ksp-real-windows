@@ -1,17 +1,31 @@
 // Depth cut-outs for painted windows (seeThroughWindows). One quad over each
 // looked-through part's window area on screen, drawn by the main camera right before that part's hull
-// (Renderer.sortingOrder: everything else first, then cut-out + hull per part, far
-// to near). Where the window decision (Classify, shared with the composite) says this
+// (Renderer.sortingOrder). Where the window decision (Classify, shared with the composite) says this
 // part's painted window looks out through its far window, it writes depth just in
-// front of the pane and no colour: the hull fails there and the scene already drawn
-// behind it stays. The composite then lays the glass over it.
+// front of the pane and no colour: the hull fails there. The composite lays the glass over it.
 //
-// Known limit: effects drawn after the opaque pass from the depth buffer (Scatterer's
-// atmosphere and sky, EVE's clouds, sun flares) don't appear through a cut-out; the
-// sky there stays black. Putting the depth behind back (a depth-only render plus a
-// restore draw) and clearing the deferred stencil there were tried and changed nothing.
+// Two ways to use it (seeThroughDepth):
+//
+// Plain cut-outs: everything else first, then cut-out + hull per part, far to near.
+// The scene already drawn behind the hull stays, but the depth left there is the
+// pane's, so whatever is drawn after the opaque pass and looks at depth (Scatterer's
+// sky, atmosphere and ocean, EVE's clouds, sun flares) takes the cut-out for a wall:
+// the sky there stays black. Nothing reads the stencil for this.
+//
+// True holes: the looked-through parts are drawn first, near to far, while the depth
+// behind them is still the cleared far plane: cut-out, hull, then this shader again
+// as the re-open draw (_RW_CoverOpen, ZTest Always) over the same pixels, putting the
+// far plane back. The rest of the scene then draws into a real hole, with its own
+// colour and depth, and everything that comes later sees what is really there. In
+// deferred this all happens in the G-buffer pass, before the depth texture is taken.
+// In forward the depth texture comes from a pre-pass these quads are not in.
 Shader "Hidden/RealWindows/Cover"
 {
+    Properties
+    {
+        _RW_CoverZTest ("ZTest", Float) = 4   // LEqual; the re-open material sets Always
+    }
+
     SubShader
     {
         Tags { "Queue" = "Geometry" "RenderType" = "Opaque" }
@@ -23,6 +37,7 @@ Shader "Hidden/RealWindows/Cover"
             float _RW_CoverEps;    // metres in front of the pane
             float4 _RW_CoverCam;   // the main camera's position and pixel width: no cut-outs in any other camera
             float4 _RW_CoverRect;  // viewport area covered (x0, y0, x1, y1): this part's windows
+            float _RW_CoverOpen;   // 1: the re-open draw, far plane over the cut-out's pixels
 
             struct appc
             {
@@ -60,6 +75,17 @@ Shader "Hidden/RealWindows/Cover"
                 float4 c = Classify(uv);
                 if (c.z < 0.5)
                     discard;
+                if (_RW_CoverOpen > 0.5)
+                {
+                    // the same pixels the cut-out wrote (same decision, and nothing else
+                    // has been drawn in front of this part yet): back to the cleared depth
+                #if defined(UNITY_REVERSED_Z)
+                    depth = 0.0;
+                #else
+                    depth = 1.0;
+                #endif
+                    return;
+                }
                 float eye = max(hull.y - _RW_CoverEps, _ProjectionParams.y * 1.01);
                 depth = (1.0 / eye - _ZBufferParams.w) / _ZBufferParams.z;
                 return;
@@ -70,7 +96,7 @@ Shader "Hidden/RealWindows/Cover"
         {
             Tags { "LightMode" = "ForwardBase" }
             ZWrite On
-            ZTest LEqual
+            ZTest [_RW_CoverZTest]
             Cull Off
             ColorMask 0
 
@@ -85,7 +111,7 @@ Shader "Hidden/RealWindows/Cover"
         {
             Tags { "LightMode" = "Deferred" }
             ZWrite On
-            ZTest LEqual
+            ZTest [_RW_CoverZTest]
             Cull Off
             ColorMask 0
 

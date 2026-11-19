@@ -52,6 +52,9 @@ namespace RealWindows
         public static bool seeIntoNeighbours = true;     // a window may show another part's interior drawn in the same render (open hatches)
         public static bool seeThroughWindows = true;     // where a window's view leaves the cabin, look at the hull behind (another window, the scene through real glass, cut-outs in painted glass)
         public static int seeThroughHoleParts = 12;      // ...for at most this many parts (nearest first)
+        public const int HolesAuto = 0, HolesOff = 1, HolesOn = 2;
+        public static int seeThroughDepth = HolesAuto;   // cut-outs as true holes (the scene behind keeps its own depth, so sky, atmosphere and clouds show through): Auto = in deferred rendering, Off, On
+        public static string holeCompositeEvent = "AfterForwardAlpha";   // ...their glass is then laid after those effects
         public static bool hideDepthMasks = true;        // interior depth masks (FreeIva hatch doorways) skipped in our render
         public static bool hideInteriorGlass = true;     // the IVA's own transparent window glass skipped in our render
         public static bool scissorPasses = true;         // id/depth passes drawn only over the windows' screen area
@@ -98,7 +101,7 @@ namespace RealWindows
         public static float sceneDepthEpsilon = 0.15f;
 
         // debug
-        public static int debugMode = 0;                 // 0 off, 1 mask, 2 part IDs, 3 x-ray, 4 interior raw
+        public static int debugMode = 0;                 // 0 off, 1 mask, 2 part IDs, 3 x-ray, 4 interior raw, 5 window verdict, 6 see-through decision, 7 scene depth
         public static KeyCombo toggleKey = KeyCombo.Parse("Alt+F8");   // switches the whole mod on and off in flight
         public static bool startEnabled = true;          // state at the start of each flight scene
         public static KeyCode debugCycleKey = KeyCode.None;
@@ -174,6 +177,13 @@ namespace RealWindows
                 B(n, "seeIntoNeighbours", ref seeIntoNeighbours);
                 B(n, "seeThroughWindows", ref seeThroughWindows);
                 I(n, "seeThroughHoleParts", ref seeThroughHoleParts);
+                string std = n.GetValue("seeThroughDepth");
+                if (!string.IsNullOrEmpty(std))
+                {
+                    std = std.Trim().ToLowerInvariant();
+                    seeThroughDepth = std == "off" || std == "false" ? HolesOff : std == "on" || std == "true" ? HolesOn : HolesAuto;
+                }
+                S(n, "holeCompositeEvent", ref holeCompositeEvent);
                 I(n, "maxUvTiles", ref maxUvTiles);
                 F(n, "transmission", ref transmission);
                 F(n, "feather", ref feather);

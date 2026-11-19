@@ -22,7 +22,8 @@
 //      the hull pixel is a window and the interior seen there is that part's or
 //      one drawn in the same render, with the glass look on top. With the camera
 //      inside a part, its interior is shown whole, and drawn a second time after
-//      clouds and atmosphere.
+//      clouds and atmosphere. With true holes (seeThroughDepth) the glass of the
+//      cut-outs is a third buffer, also after clouds and atmosphere.
 //
 // Passes 2-3 run once per alignment group with the group's own exact
 // world->internal map (see Alignment.cs); all groups share one depth buffer
@@ -101,6 +102,15 @@ namespace RealWindows
         // depth cut-outs (seeThroughWindows): per looked-through part, a quad over its windows
         // drawn by the main camera just before that part's hull (Renderer.sortingOrder)
         private Material matCover;
+        // true holes (seeThroughDepth): the looked-through parts are drawn first, near to
+        // far, and after each hull a second quad puts the far plane back where the
+        // cut-out wrote the pane's depth. What is drawn later (the rest of the scene,
+        // then sky, atmosphere, clouds) finds a real hole there. See RW_Cover.shader.
+        private Material matReopen;
+        private readonly List<MeshRenderer> reopens = new List<MeshRenderer>();
+        private bool trueHoles;         // this frame's cut-outs are true holes
+        private int holesState = -1;    // last logged: 0 plain cut-outs, 1 true holes
+        private const int HoleOrderBase = -3000;
         private Mesh coverMesh;
         private readonly List<MeshRenderer> covers = new List<MeshRenderer>();
         private readonly MaterialPropertyBlock coverBlock = new MaterialPropertyBlock();
@@ -141,6 +151,12 @@ namespace RealWindows
         private Camera insideCamera;
         private CameraEvent insideEvent;
         private bool insideAttached;
+        // true holes: the glass of the cut-outs, laid after the sky, atmosphere and
+        // clouds now drawn into them (they would cover a pane laid before)
+        private readonly CommandBuffer cbHoles = new CommandBuffer { name = "RealWindows cut-out glass" };
+        private Camera holesCamera;
+        private CameraEvent holesEvent;
+        private bool holesAttached;
         private readonly List<Renderer> masksHidden = new List<Renderer>();
         private readonly List<Renderer> staticHidden = new List<Renderer>();   // cached interiors' shell/props, off in the Kerbals pass
         // render group of each part id (index = id, -1 none): the composite lets a
@@ -200,6 +216,7 @@ namespace RealWindows
         private static readonly int PID_LayerSize = Shader.PropertyToID("_RW_LayerSize");
         private static readonly int PID_BehindEps = Shader.PropertyToID("_RW_BehindEps");
         private static readonly int PID_DrawRect = Shader.PropertyToID("_RW_DrawRect");
+        private static readonly int PID_LateHoles = Shader.PropertyToID("_RW_LateHoles");
         // switched off (toggle key / startEnabled): nothing attached; cleared each
         // frame by the addon while switched on
         public bool suspended = true;
@@ -215,7 +232,12 @@ namespace RealWindows
             matProbe = new Material(ShaderBundle.ProbeShader) { name = "RW probe" };
             matComposite = new Material(ShaderBundle.CompositeShader) { name = "RW composite" };
             if (ShaderBundle.CoverShader != null)
+            {
                 matCover = new Material(ShaderBundle.CoverShader) { name = "RW window cut-out" };
+                matReopen = new Material(ShaderBundle.CoverShader) { name = "RW window cut-out re-open" };
+                matReopen.SetFloat("_RW_CoverZTest", (float)CompareFunction.Always);
+                matReopen.SetFloat("_RW_CoverOpen", 1f);
+            }
             // Bind the camera's own target first: a buffer that runs before ours on the
             // same event may leave something else bound. Cinematic Shaders' GTAO ends in
             // a native plugin event that binds its own targets behind Unity's back; once
@@ -225,12 +247,16 @@ namespace RealWindows
             {
                 cbComposite.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
                 cbInside.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                cbHoles.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
             }
             // a quad over _RW_DrawRect (the windows' area, set every frame)
             cbComposite.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 6);
             cbInside.DrawProcedural(Matrix4x4.identity, matComposite, 1, MeshTopology.Triangles, 6);
+            cbHoles.DrawProcedural(Matrix4x4.identity, matComposite, 2, MeshTopology.Triangles, 6);
             try { insideEvent = (CameraEvent)Enum.Parse(typeof(CameraEvent), RWSettings.insideCompositeEvent, true); }
             catch (Exception) { insideEvent = CameraEvent.AfterForwardAlpha; }
+            try { holesEvent = (CameraEvent)Enum.Parse(typeof(CameraEvent), RWSettings.holeCompositeEvent, true); }
+            catch (Exception) { holesEvent = CameraEvent.AfterForwardAlpha; }
 
             try { compositeEvent = (CameraEvent)Enum.Parse(typeof(CameraEvent), RWSettings.compositeEvent, true); }
             catch (Exception) { compositeEvent = CameraEvent.AfterForwardOpaque; }
@@ -264,6 +290,7 @@ namespace RealWindows
                 suspended = false;
                 Attach();
                 AttachInside();
+                AttachHoles();
             }
             return true;
         }
@@ -278,11 +305,17 @@ namespace RealWindows
                 if (covers[i] != null)
                     UnityEngine.Object.Destroy(covers[i].gameObject);
             covers.Clear();
+            for (int i = 0; i < reopens.Count; i++)
+                if (reopens[i] != null)
+                    UnityEngine.Object.Destroy(reopens[i].gameObject);
+            reopens.Clear();
             if (coverMesh != null) UnityEngine.Object.Destroy(coverMesh);
             ReleaseBaked();
             if (matCover != null) UnityEngine.Object.Destroy(matCover);
+            if (matReopen != null) UnityEngine.Object.Destroy(matReopen);
             Detach();
             DetachInside();
+            DetachHoles();
             RestoreDepthMode();
             for (int i = 0; i < allInteriors.Count; i++)
             {
@@ -302,6 +335,7 @@ namespace RealWindows
             cbPasses.Release();
             cbComposite.Release();
             cbInside.Release();
+            cbHoles.Release();
         }
 
         // Switched off: nothing attached to the camera, nothing parked, no lists.
@@ -311,6 +345,7 @@ namespace RealWindows
             suspended = true;
             Detach();
             DetachInside();
+            DetachHoles();
             RestoreDepthMode();
             for (int i = 0; i < allInteriors.Count; i++)
             {
@@ -404,11 +439,13 @@ namespace RealWindows
             {
                 Detach();
                 DetachInside();
+                DetachHoles();
             }
             else
             {
                 Attach();
                 AttachInside();
+                AttachHoles();
             }
         }
 
@@ -536,7 +573,10 @@ namespace RealWindows
             PickHoleParts();
             SetCompositeParams(matComposite, sun, true);
             if (matCover != null)
+            {
                 SetCompositeParams(matCover, sun, false); // the cut-outs leave things in front to the depth test
+                SetCompositeParams(matReopen, sun, false);
+            }
             Lap(PhCommands);
 
             Graphics.ExecuteCommandBuffer(cbPasses);
@@ -546,6 +586,7 @@ namespace RealWindows
             RenderInteriorColour();
             BindInterior(matComposite);
             BindInterior(matCover);
+            BindInterior(matReopen);
 
             RenderTexture.active = prevActive;
 
@@ -556,12 +597,15 @@ namespace RealWindows
         }
 
         // Parts whose painted windows get depth cut-outs this frame: the rendered ones,
-        // nearest first up to seeThroughHoleParts, then ordered far to near for drawing.
+        // nearest first up to seeThroughHoleParts, then ordered for drawing: far to near
+        // after the rest of the scene, or as true holes near to far before it (a part
+        // seen through another's hole has to come after that hole is re-opened).
         private void PickHoleParts()
         {
             for (int i = 0; i < holeIds.Length; i++)
                 holeIds[i] = 0f;
             holeParts.Clear();
+            trueHoles = false;
             if (!behindDrawn || matCover == null || ivaView || insideId > 0)
                 return;
             for (int g = 0; g < groups.Count; g++)
@@ -574,14 +618,41 @@ namespace RealWindows
             holeParts.Sort((a, b) => a.distance.CompareTo(b.distance));
             if (holeParts.Count > RWSettings.seeThroughHoleParts)
                 holeParts.RemoveRange(RWSettings.seeThroughHoleParts, holeParts.Count - RWSettings.seeThroughHoleParts);
-            holeParts.Reverse();
+            trueHoles = holeParts.Count > 0 && WantTrueHoles();
+            if (!trueHoles)
+                holeParts.Reverse();
             for (int i = 0; i < holeParts.Count; i++)
                 holeIds[holeParts[i].frameId] = 1f;
+            if (holeParts.Count > 0 && holesState != (trueHoles ? 1 : 0))
+            {
+                holesState = trueHoles ? 1 : 0;
+                RWLog.Info(trueHoles
+                    ? "window cut-outs are true holes: the scene behind keeps its depth ({0} rendering, glass at {1})"
+                    : "window cut-outs keep the pane's depth: sky effects don't show through them ({0} rendering)",
+                    main.actualRenderingPath, holesEvent);
+            }
+        }
+
+        // True holes need the depth put back before anything reads it. In deferred the
+        // cut-outs are in the G-buffer pass, so the depth texture gets the real depth
+        // too. In forward that texture comes from a pre-pass they are not in: only
+        // what tests against the depth buffer would be right, so not unless asked for.
+        private bool WantTrueHoles()
+        {
+            if (matReopen == null)
+                return false;
+            if (RWSettings.seeThroughDepth == RWSettings.HolesOff)
+                return false;
+            if (RWSettings.seeThroughDepth == RWSettings.HolesOn)
+                return true;
+            return main.actualRenderingPath == RenderingPath.DeferredShading;
         }
 
         // Switched on for the main camera's render only (OnPostRenderAny switches them
         // off): every other renderer keeps its order and comes first; then, far to near,
-        // each part's cut-out and right after it the part's opaque hull renderers.
+        // each part's cut-out and right after it the part's opaque hull renderers. As
+        // true holes these come before every other renderer instead, near to far, each
+        // part followed by the quad that re-opens its cut-out.
         private void EnableCovers()
         {
             if (holeParts.Count == 0 || matCover == null)
@@ -597,17 +668,28 @@ namespace RealWindows
             Vector3 cp = main.transform.position;
             matCover.SetFloat("_RW_CoverEps", 0.02f);
             matCover.SetVector("_RW_CoverCam", new Vector4(cp.x, cp.y, cp.z, main.pixelWidth));
+            matReopen.SetFloat("_RW_CoverEps", 0.02f);
+            matReopen.SetVector("_RW_CoverCam", new Vector4(cp.x, cp.y, cp.z, main.pixelWidth));
             reorderSeen.Clear();
             for (int i = 0; i < holeParts.Count; i++)
             {
                 PartPortal p = holeParts[i];
-                MeshRenderer cr = Cover(i);
+                int order = trueHoles ? HoleOrderBase + 3 * i : CoverOrderBase + 2 * i;
+                MeshRenderer cr = Quad(covers, matCover, "RealWindows Cut-out ", i);
                 cr.transform.position = cp;
-                cr.sortingOrder = CoverOrderBase + 2 * i;
+                cr.sortingOrder = order;
                 coverBlock.SetFloat("_RW_CoverId", p.frameId);
                 coverBlock.SetVector("_RW_CoverRect", PadRect(p.screenArea));
                 cr.SetPropertyBlock(coverBlock);
                 cr.enabled = true;
+                if (trueHoles)
+                {
+                    MeshRenderer rr = Quad(reopens, matReopen, "RealWindows Cut-out re-open ", i);
+                    rr.transform.position = cp;
+                    rr.sortingOrder = order + 2;
+                    rr.SetPropertyBlock(coverBlock);
+                    rr.enabled = true;
+                }
                 for (int k = 0; k < p.exterior.Count; k++)
                 {
                     Renderer r = p.exterior[k].r;
@@ -615,7 +697,7 @@ namespace RealWindows
                         continue;
                     reordered.Add(r);
                     reorderedWas.Add(r.sortingOrder);
-                    r.sortingOrder = CoverOrderBase + 2 * i + 1;
+                    r.sortingOrder = order + 1;
                 }
             }
             coversActive = true;
@@ -630,15 +712,16 @@ namespace RealWindows
             return new Vector4(Mathf.Clamp01(r.xMin - dx), Mathf.Clamp01(r.yMin - dy), Mathf.Clamp01(r.xMax + dx), Mathf.Clamp01(r.yMax + dy));
         }
 
-        private MeshRenderer Cover(int i)
+        // The i-th quad of a pool (cut-outs, re-opens), made when first needed.
+        private MeshRenderer Quad(List<MeshRenderer> pool, Material mat, string name, int i)
         {
-            while (covers.Count <= i)
+            while (pool.Count <= i)
             {
-                GameObject go = new GameObject("RealWindows Cut-out " + covers.Count);
+                GameObject go = new GameObject(name + pool.Count);
                 go.layer = 0;
                 go.AddComponent<MeshFilter>().sharedMesh = coverMesh;
                 MeshRenderer mr = go.AddComponent<MeshRenderer>();
-                mr.sharedMaterial = matCover;
+                mr.sharedMaterial = mat;
                 mr.shadowCastingMode = ShadowCastingMode.Off;
                 mr.receiveShadows = false;
                 mr.lightProbeUsage = LightProbeUsage.Off;
@@ -646,9 +729,9 @@ namespace RealWindows
                 mr.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
                 mr.allowOcclusionWhenDynamic = false;
                 mr.enabled = false;
-                covers.Add(mr);
+                pool.Add(mr);
             }
-            return covers[i];
+            return pool[i];
         }
 
         private static bool AnyTransparent(Renderer r)
@@ -667,6 +750,9 @@ namespace RealWindows
             for (int i = 0; i < covers.Count; i++)
                 if (covers[i] != null)
                     covers[i].enabled = false;
+            for (int i = 0; i < reopens.Count; i++)
+                if (reopens[i] != null)
+                    reopens[i].enabled = false;
             for (int i = 0; i < reordered.Count; i++)
                 if (reordered[i] != null)
                     reordered[i].sortingOrder = reorderedWas[i];
@@ -718,6 +804,7 @@ namespace RealWindows
             mat.SetFloatArray("_RW_IdGroup", idGroup);
             mat.SetFloat("_RW_SeeNeighbours", RWSettings.seeIntoNeighbours ? 1f : 0f);
             mat.SetFloatArray("_RW_HoleIds", holeIds);
+            mat.SetFloat(PID_LateHoles, trueHoles ? 1f : 0f);
             // the colour render's depth (cached shell/props + kerbals), so props and kerbals
             // in front of a far window keep the interior; only with the split colour pass
             bool intDepth = RWSettings.interiorRefresh >= 0f && staticColorRT != null && staticDepthRT != null && dynDepthRT != null;
@@ -1526,7 +1613,8 @@ namespace RealWindows
                 return;
             bool depthLost = depthModeTouched && (main.depthTextureMode & DepthTextureMode.Depth) == 0;
             bool bufferLost = (compositeAttached && !HasBuffer(compositeCamera, compositeEvent, cbComposite))
-                              || (insideAttached && !HasBuffer(insideCamera, insideEvent, cbInside));
+                              || (insideAttached && !HasBuffer(insideCamera, insideEvent, cbInside))
+                              || (holesAttached && !HasBuffer(holesCamera, holesEvent, cbHoles));
             if (switched || depthLost || bufferLost)
                 RWLog.Verbose("camera {0}: {1} rendering, depth texture {2}, HDR {3}, composite {4}",
                     CameraManager.Instance != null ? CameraManager.Instance.currentCameraMode.ToString() : "?",
@@ -1547,6 +1635,7 @@ namespace RealWindows
                 // attached again below, this frame (last in line: only when it was gone)
                 Detach();
                 DetachInside();
+                DetachHoles();
             }
             if (switched || bufferLost)
                 staticAt = -1f;
@@ -1623,6 +1712,31 @@ namespace RealWindows
                 insideCamera.RemoveCommandBuffer(insideEvent, cbInside);
             insideAttached = false;
             insideCamera = null;
+        }
+
+        // Always attached while switched on, like the composite: it draws nothing unless
+        // this frame has true holes (or the scene depth debug view is up).
+        private void AttachHoles()
+        {
+            if (holesAttached && holesCamera == main)
+                return;
+            DetachHoles();
+            if (main == null || matReopen == null)
+                return;
+            main.AddCommandBuffer(holesEvent, cbHoles);
+            holesCamera = main;
+            holesAttached = true;
+            RWLog.Verbose("cut-out glass attached to {0} at {1}", main.name, holesEvent);
+        }
+
+        private void DetachHoles()
+        {
+            if (!holesAttached)
+                return;
+            if (holesCamera != null)
+                holesCamera.RemoveCommandBuffer(holesEvent, cbHoles);
+            holesAttached = false;
+            holesCamera = null;
         }
 
         private void RestoreDepthMode()
