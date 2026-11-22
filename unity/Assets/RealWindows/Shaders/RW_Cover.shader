@@ -6,10 +6,11 @@
 // front of the pane and no colour: the hull fails there and the scene already drawn
 // behind it stays. The composite then lays the glass over it.
 //
-// Known limit: effects drawn after the opaque pass from the depth buffer (Scatterer's
-// atmosphere and sky, EVE's clouds, sun flares) don't appear through a cut-out; the
-// sky there stays black. Putting the depth behind back (a depth-only render plus a
-// restore draw) and clearing the deferred stencil there were tried and changed nothing.
+// The depth written here stays the pane's, so effects drawn after the opaque pass from the
+// depth (Scatterer's sky and scattering, EVE's clouds) would take the hole for a surface at
+// the window. With deferred rendering the composite's pass 2 puts the depth of what lies
+// behind back right after the opaque pass (skyThroughCutOuts); in forward rendering the
+// sky through a cut-out stays black.
 Shader "Hidden/RealWindows/Cover"
 {
     SubShader

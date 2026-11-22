@@ -14,12 +14,14 @@ namespace RealWindows
         public const string HullShaderName = "Hidden/RealWindows/Hull";
         public const string ProbeShaderName = "Hidden/RealWindows/Probe";
         public const string CoverShaderName = "Hidden/RealWindows/Cover";   // optional: the cut-outs of seeThroughWindows
+        public const string BehindDepthShaderName = "Hidden/RealWindows/BehindDepth";   // optional: skyDepthFix experiment
 
         public static Shader IdShader;
         public static Shader CompositeShader;
         public static Shader HullShader;
         public static Shader ProbeShader;
         public static Shader CoverShader;
+        public static Shader BehindDepthShader;
 
         private static bool attempted;
 
@@ -63,6 +65,7 @@ namespace RealWindows
                     else if (shaders[i].name == HullShaderName) HullShader = shaders[i];
                     else if (shaders[i].name == ProbeShaderName) ProbeShader = shaders[i];
                     else if (shaders[i].name == CoverShaderName) CoverShader = shaders[i];
+                    else if (shaders[i].name == BehindDepthShaderName) BehindDepthShader = shaders[i];
                 }
                 bundle.Unload(false);
                 if (!Ready)

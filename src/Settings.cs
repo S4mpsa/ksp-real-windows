@@ -52,6 +52,7 @@ namespace RealWindows
         public static bool seeIntoNeighbours = true;     // a window may show another part's interior drawn in the same render (open hatches)
         public static bool seeThroughWindows = true;     // where a window's view leaves the cabin, look at the hull behind (another window, the scene through real glass, cut-outs in painted glass)
         public static int seeThroughHoleParts = 12;      // ...for at most this many parts (nearest first)
+        public static bool skyThroughCutOuts = true;     // deferred only: sky, clouds and haze show through the cut-outs (their depth is put back)
         public static bool hideDepthMasks = true;        // interior depth masks (FreeIva hatch doorways) skipped in our render
         public static bool hideInteriorGlass = true;     // the IVA's own transparent window glass skipped in our render
         public static bool scissorPasses = true;         // id/depth passes drawn only over the windows' screen area
@@ -174,6 +175,7 @@ namespace RealWindows
                 B(n, "seeIntoNeighbours", ref seeIntoNeighbours);
                 B(n, "seeThroughWindows", ref seeThroughWindows);
                 I(n, "seeThroughHoleParts", ref seeThroughHoleParts);
+                B(n, "skyThroughCutOuts", ref skyThroughCutOuts);
                 I(n, "maxUvTiles", ref maxUvTiles);
                 F(n, "transmission", ref transmission);
                 F(n, "feather", ref feather);
@@ -237,7 +239,6 @@ namespace RealWindows
                 }
                 B(n, "startEnabled", ref startEnabled);
                 alignmentDumpKey = Key(n, "alignmentDumpKey", alignmentDumpKey);
-
                 renderScale = Mathf.Clamp(renderScale, 0.25f, 2f);
                 createPerFrame = Math.Max(1, createPerFrame);
                 maxInteriors = Math.Max(1, maxInteriors);

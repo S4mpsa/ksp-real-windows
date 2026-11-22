@@ -216,19 +216,18 @@ namespace RealWindows
             matComposite = new Material(ShaderBundle.CompositeShader) { name = "RW composite" };
             if (ShaderBundle.CoverShader != null)
                 matCover = new Material(ShaderBundle.CoverShader) { name = "RW window cut-out" };
+            matFix = new Material(ShaderBundle.CompositeShader) { name = "RW sky depth fix" };
             // Bind the camera's own target first: a buffer that runs before ours on the
             // same event may leave something else bound. Cinematic Shaders' GTAO ends in
             // a native plugin event that binds its own targets behind Unity's back; once
             // our composite ran after it (re-attached after IVA and back), it drew into
             // GTAO's texture and every window lost its interior.
             if (RWSettings.bindCameraTarget)
-            {
-                cbComposite.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
                 cbInside.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
-            }
             // a quad over _RW_DrawRect (the windows' area, set every frame)
-            cbComposite.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 6);
+            BuildComposite(false);
             cbInside.DrawProcedural(Matrix4x4.identity, matComposite, 1, MeshTopology.Triangles, 6);
+            buffersLogAt = Time.unscaledTime + 15f;
             try { insideEvent = (CameraEvent)Enum.Parse(typeof(CameraEvent), RWSettings.insideCompositeEvent, true); }
             catch (Exception) { insideEvent = CameraEvent.AfterForwardAlpha; }
 
@@ -251,6 +250,7 @@ namespace RealWindows
             if (RWSettings.verboseLogging)
                 diagAt = Time.unscaledTime + 20f;
             Camera.onPreCull += OnPreCullAny;
+            Camera.onPreRender += OnPreRenderAny;
             Camera.onPostRender += OnPostRenderAny;
             GameEvents.OnCameraChange.Add(OnCameraChange);
 
@@ -271,6 +271,7 @@ namespace RealWindows
         public void Dispose()
         {
             Camera.onPreCull -= OnPreCullAny;
+            Camera.onPreRender -= OnPreRenderAny;
             Camera.onPostRender -= OnPostRenderAny;
             GameEvents.OnCameraChange.Remove(OnCameraChange);
             DisableCovers();
@@ -299,9 +300,14 @@ namespace RealWindows
             if (matHull != null) UnityEngine.Object.Destroy(matHull);
             if (matProbe != null) UnityEngine.Object.Destroy(matProbe);
             if (matComposite != null) UnityEngine.Object.Destroy(matComposite);
+            DetachLate();
+            ReleaseBehind();
+            if (behindCam != null) UnityEngine.Object.Destroy(behindCam.gameObject);
+            if (matFix != null) UnityEngine.Object.Destroy(matFix);
             cbPasses.Release();
             cbComposite.Release();
             cbInside.Release();
+            cbLate.Release();
         }
 
         // Switched off: nothing attached to the camera, nothing parked, no lists.
@@ -309,6 +315,7 @@ namespace RealWindows
         {
             wantActive = false;
             suspended = true;
+            DetachLate();
             Detach();
             DetachInside();
             RestoreDepthMode();
@@ -398,6 +405,9 @@ namespace RealWindows
             {
                 if (matComposite != null)
                     matComposite.SetVector(PID_DrawRect, Vector4.zero);
+                // the fix-up writes depth: never from last frame's window decision
+                if (matFix != null)
+                    matFix.SetVector(PID_DrawRect, Vector4.zero);
                 staticAt = -1f; // whatever is cached may be out of date by the next render
             }
             if (suspended)
@@ -410,6 +420,7 @@ namespace RealWindows
                 Attach();
                 AttachInside();
             }
+            UpdateSky();
         }
 
         private bool RenderPasses()
@@ -537,6 +548,9 @@ namespace RealWindows
             SetCompositeParams(matComposite, sun, true);
             if (matCover != null)
                 SetCompositeParams(matCover, sun, false); // the cut-outs leave things in front to the depth test
+            bool skyFix = builtSky && builtDeferred && RWSettings.seeThroughWindows && matFix != null;
+            if (skyFix)
+                SetCompositeParams(matFix, sun, false);   // the fix-up decides exactly like the cut-outs
             Lap(PhCommands);
 
             Graphics.ExecuteCommandBuffer(cbPasses);
@@ -546,6 +560,15 @@ namespace RealWindows
             RenderInteriorColour();
             BindInterior(matComposite);
             BindInterior(matCover);
+            if (skyFix)
+                BindInterior(matFix);
+
+            // sky through cut-outs: the depth of what lies behind them
+            bool behind = skyFix && holeParts.Count > 0
+                && main.actualRenderingPath == RenderingPath.DeferredShading && RenderBehindDepth();
+            if (matFix != null)
+                matFix.SetFloat("_RW_UseBehindDepth", behind ? 1f : 0f);
+            Lap(PhOther);
 
             RenderTexture.active = prevActive;
 
@@ -1578,6 +1601,243 @@ namespace RealWindows
                 main.depthTextureMode |= DepthTextureMode.Depth;
         }
 
+        // ---- sky through cut-outs (skyThroughCutOuts; deferred rendering only) ----
+        // A cut-out writes the pane's depth so the hull fails over it, and that depth stays:
+        // effects that draw from the depth after the opaque pass (Scatterer's local sky and
+        // scattering, EVE's clouds) then take the hole for a surface at the window. Near a
+        // planet that left the sky black and the ground seen through a cut-out without
+        // clouds or haze (high up, where Scatterer draws the atmosphere in scaled space, it
+        // showed). The fix-up, first on AfterForwardOpaque, puts back the depth of what lies
+        // behind each cut-out pixel: the far plane where the G-buffer is empty there (the
+        // cut-out writes no G-buffer data, so it still holds what was drawn behind), else the
+        // depth of the scene behind from a depth-only render without the cut-out parts'
+        // hulls, or the behind layer's hull; into the camera's depth buffer and the resolved
+        // depth (EVE reads that). The glass over cut-outs is then drawn after the sky and
+        // clouds (AfterForwardAlpha), which would otherwise draw over it. Tried on
+        // 2026-11-23 (1.12.5, Deferred + Scatterer + EVE volumetric clouds): ~0.2 ms CPU per
+        // frame for the depth render and the fix-up.
+        private bool builtSky;
+        private bool builtDeferred;
+        private float buffersLogAt = -1f;
+        private bool buffersLogPending;
+        private readonly CommandBuffer cbLate = new CommandBuffer { name = "RealWindows cut-out glass" };
+        private Camera lateCamera;
+        private bool lateAttached;
+        // after Scatterer's scattering (BeforeForwardAlpha) and EVE's clouds (AfterForwardOpaque),
+        // before anti-aliasing and the post-processing stack (TUFX at BeforeImageEffects would
+        // otherwise tonemap the scene before this glass is laid over it)
+        private const CameraEvent LateEvent = CameraEvent.AfterForwardAlpha;
+        private Material matFix;   // fix-up pass: the cut-outs' window decision (no scene-depth test)
+        private Camera behindCam;
+        private RenderTexture behindDepthRT, behindColorRT;
+        private readonly List<Renderer> behindHidden = new List<Renderer>();
+        public int behindRenders;   // for the status line
+        private bool warnedBehind;
+
+        private bool SkyWanted(bool deferred)
+        {
+            return RWSettings.skyThroughCutOuts && RWSettings.seeThroughWindows && deferred && matFix != null;
+        }
+
+        // The composite buffer: the fix-up in front of the composite when wanted. Rebuilt in
+        // place, so the buffer keeps its place on the event.
+        private void BuildComposite(bool deferred)
+        {
+            builtSky = RWSettings.skyThroughCutOuts;
+            builtDeferred = deferred;
+            cbComposite.Clear();
+            bool fix = SkyWanted(deferred);
+            if (fix)
+            {
+                cbComposite.SetGlobalTexture("_CameraGBufferTexture2", BuiltinRenderTextureType.GBuffer2);
+                cbComposite.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                cbComposite.DrawProcedural(Matrix4x4.identity, matFix, 2, MeshTopology.Triangles, 6);
+                // the resolved depth, bound as the depth target (colour writes are off)
+                cbComposite.SetRenderTarget(BuiltinRenderTextureType.CameraTarget, BuiltinRenderTextureType.ResolvedDepth);
+                cbComposite.DrawProcedural(Matrix4x4.identity, matFix, 2, MeshTopology.Triangles, 6);
+            }
+            if (RWSettings.bindCameraTarget || fix)
+                cbComposite.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+            cbComposite.DrawProcedural(Matrix4x4.identity, matComposite, 0, MeshTopology.Triangles, 6);
+            if (main != null)
+                RWLog.Verbose("sky through cut-outs {0} ({1} rendering)", fix ? "on" : "off", main.actualRenderingPath);
+        }
+
+        // Once a main-camera frame: the composite buffer follows the setting and the
+        // rendering path; the late glass buffer (attached with the inside view, so it keeps
+        // its early place on its event) draws only while the fix-up is on.
+        private bool builtLate;
+
+        private void UpdateSky()
+        {
+            if (main == null)
+                return;
+            bool deferred = main.actualRenderingPath == RenderingPath.DeferredShading;
+            if (RWSettings.skyThroughCutOuts != builtSky || deferred != builtDeferred)
+                BuildComposite(deferred);
+            bool wantLate = SkyWanted(deferred) && !suspended;
+            matComposite.SetFloat("_RW_LateGlass", wantLate ? 1f : 0f);
+            if (wantLate != builtLate)
+            {
+                builtLate = wantLate;
+                cbLate.Clear();
+                if (wantLate)
+                {
+                    cbLate.SetRenderTarget(BuiltinRenderTextureType.CameraTarget);
+                    cbLate.DrawProcedural(Matrix4x4.identity, matComposite, 3, MeshTopology.Triangles, 6);
+                }
+            }
+            if (buffersLogAt > 0f && Time.unscaledTime >= buffersLogAt && RWSettings.verboseLogging)
+            {
+                buffersLogAt = -1f;
+                buffersLogPending = true; // logged from the camera's pre-render, once other mods added this frame's buffers
+            }
+        }
+
+        // The depth of the scene without the cut-out parts' hulls, over the cut-outs' screen
+        // area only: one extra camera render with a depth-only replacement shader (opaque and
+        // alpha-tested objects), no shadows. Named "DepthCamera", which EVE's clouds and
+        // particles and Scatterer's scattering leave alone. Its own colour target catches
+        // whatever other mods still draw into it (Scatterer's local sky). Depth target 32-bit:
+        // distant terrain's reversed-Z depth is tiny and needs float precision (with 24 bits
+        // and a loose far test, a ring of terrain 100-200 km out lost its atmosphere).
+        private bool RenderBehindDepth()
+        {
+            if (ShaderBundle.BehindDepthShader == null)
+                return false;
+            int w = main.pixelWidth, h = main.pixelHeight;
+            if (behindDepthRT == null || behindDepthRT.width != w || behindDepthRT.height != h)
+            {
+                ReleaseBehind();
+                behindDepthRT = new RenderTexture(w, h, 32, RenderTextureFormat.Depth) { name = "RW behind depth" };
+                behindColorRT = new RenderTexture(w, h, 0, RenderTextureFormat.R8) { name = "RW behind colour (unused)" };
+                if (!behindDepthRT.Create() || !behindColorRT.Create())
+                {
+                    if (!warnedBehind)
+                    {
+                        warnedBehind = true;
+                        RWLog.Warn("depth-behind targets unavailable: through cut-outs, only open sky gets its depth back");
+                    }
+                    ReleaseBehind();
+                    return false;
+                }
+            }
+            if (behindCam == null)
+            {
+                GameObject go = new GameObject("DepthCamera");
+                UnityEngine.Object.DontDestroyOnLoad(go);
+                behindCam = go.AddComponent<Camera>();
+                behindCam.enabled = false;
+                behindCam.renderingPath = RenderingPath.Forward;
+                behindCam.allowHDR = false;
+                behindCam.allowMSAA = false;
+                behindCam.useOcclusionCulling = false;
+                behindCam.clearFlags = CameraClearFlags.SolidColor;
+                behindCam.backgroundColor = Color.clear;
+                behindCam.depthTextureMode = DepthTextureMode.None;
+            }
+            // the cut-outs' screen area
+            Rect r = holeParts[0].screenArea;
+            for (int i = 1; i < holeParts.Count; i++)
+            {
+                Rect a = holeParts[i].screenArea;
+                r = Rect.MinMaxRect(Mathf.Min(r.xMin, a.xMin), Mathf.Min(r.yMin, a.yMin), Mathf.Max(r.xMax, a.xMax), Mathf.Max(r.yMax, a.yMax));
+            }
+            Vector4 pr = PadRect(r);
+            r = Rect.MinMaxRect(pr.x, pr.y, pr.z, pr.w);
+            if (r.width <= 0f || r.height <= 0f)
+                return false;
+
+            Transform mt = main.transform;
+            behindCam.transform.SetPositionAndRotation(mt.position, mt.rotation);
+            behindCam.nearClipPlane = main.nearClipPlane;
+            behindCam.farClipPlane = main.farClipPlane;
+            behindCam.fieldOfView = main.fieldOfView;
+            behindCam.aspect = main.aspect;
+            behindCam.cullingMask = main.cullingMask & ~((1 << LayerKerbals) | (1 << LayerInternal));
+            behindCam.SetTargetBuffers(behindColorRT.colorBuffer, behindDepthRT.depthBuffer);
+            behindCam.rect = r;
+            behindCam.projectionMatrix = Crop(r) * fullProj;
+
+            behindHidden.Clear();
+            for (int i = 0; i < holeParts.Count; i++)
+            {
+                List<DrawItem> ex = holeParts[i].exterior;
+                for (int k = 0; k < ex.Count; k++)
+                {
+                    Renderer rr = ex[k].r;
+                    if (rr != null && !rr.forceRenderingOff)
+                    {
+                        rr.forceRenderingOff = true;
+                        behindHidden.Add(rr);
+                    }
+                }
+            }
+            ShadowQuality shadows = QualitySettings.shadows;
+            QualitySettings.shadows = ShadowQuality.Disable;
+            try
+            {
+                behindCam.RenderWithShader(ShaderBundle.BehindDepthShader, "RenderType");
+                behindRenders++;
+            }
+            finally
+            {
+                QualitySettings.shadows = shadows;
+                for (int i = 0; i < behindHidden.Count; i++)
+                    if (behindHidden[i] != null)
+                        behindHidden[i].forceRenderingOff = false;
+                behindHidden.Clear();
+                behindCam.targetTexture = null;
+            }
+            matFix.SetTexture("_RW_BehindDepthTex", behindDepthRT);
+            return true;
+        }
+
+        private void ReleaseBehind()
+        {
+            if (behindDepthRT != null) { behindDepthRT.Release(); UnityEngine.Object.Destroy(behindDepthRT); behindDepthRT = null; }
+            if (behindColorRT != null) { behindColorRT.Release(); UnityEngine.Object.Destroy(behindColorRT); behindColorRT = null; }
+        }
+
+        private void DetachLate()
+        {
+            if (lateAttached && lateCamera != null)
+                lateCamera.RemoveCommandBuffer(LateEvent, cbLate);
+            lateAttached = false;
+            lateCamera = null;
+        }
+
+        // Scatterer and EVE add some buffers per frame during culling (and remove them after
+        // the render): the list is only complete from the camera's pre-render on.
+        private void OnPreRenderAny(Camera cam)
+        {
+            if (!buffersLogPending || cam != main)
+                return;
+            buffersLogPending = false;
+            LogCameraBuffers();
+        }
+
+        // verbose: the flight camera's command buffers per event, in order (other mods'
+        // effects included), once per flight scene
+        public void LogCameraBuffers()
+        {
+            if (main == null)
+                return;
+            var sb = new System.Text.StringBuilder();
+            sb.AppendFormat("flight camera {0}: {1} rendering, HDR {2}, depth texture {3}, sky through cut-outs {4}; command buffers:",
+                main.name, main.actualRenderingPath, main.allowHDR, main.depthTextureMode, builtDeferred && builtSky && RWSettings.seeThroughWindows ? "on" : "off");
+            foreach (CameraEvent e in Enum.GetValues(typeof(CameraEvent)))
+            {
+                CommandBuffer[] bufs = main.GetCommandBuffers(e);
+                if (bufs.Length == 0)
+                    continue;
+                sb.Append(" | ").Append(e).Append(": ");
+                for (int i = 0; i < bufs.Length; i++)
+                    sb.Append(i > 0 ? ", " : "").Append(bufs[i].name);
+            }
+            RWLog.Info("{0}", sb.ToString());
+        }
+
         private void Attach()
         {
             EnsureDepthMode();
@@ -1604,6 +1864,18 @@ namespace RealWindows
 
         private void AttachInside()
         {
+            // the late glass over cut-outs too: attached early like the composite, ahead of
+            // other mods' buffers on its event (it draws nothing while the fix-up is off)
+            if (!lateAttached || lateCamera != main)
+            {
+                DetachLate();
+                if (main != null)
+                {
+                    main.AddCommandBuffer(LateEvent, cbLate);
+                    lateCamera = main;
+                    lateAttached = true;
+                }
+            }
             if (insideAttached && insideCamera == main)
                 return;
             DetachInside();
@@ -1617,6 +1889,7 @@ namespace RealWindows
 
         private void DetachInside()
         {
+            DetachLate();
             if (!insideAttached)
                 return;
             if (insideCamera != null)

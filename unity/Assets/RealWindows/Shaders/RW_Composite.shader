@@ -43,6 +43,82 @@ Shader "Hidden/RealWindows/Composite"
                 return i > 0 && i < 128 && _RW_HoleIds[i] > 0.5;
             }
 
+            // ---- sky through cut-outs (skyThroughCutOuts; deferred only) ----
+            // A cut-out leaves the pane's depth, so effects that draw from the depth after the
+            // opaque pass (Scatterer's local sky and scattering, EVE's clouds) would take the
+            // hole for a surface right at the window. Pass 2 puts back the depth of what lies
+            // behind each cut-out pixel: the far plane where the G-buffer is empty there (the
+            // cut-out writes no G-buffer data, so it still holds what was drawn behind), else
+            // the real depth of the scene behind (BehindEye).
+            sampler2D _CameraGBufferTexture2;
+
+            bool CutOutPixel(float2 uv)
+            {
+                float4 c = Classify(uv);
+                return c.z > 0.5 && HasHole(c.w);
+            }
+
+            bool NothingBehind(float2 uv)
+            {
+                float3 n = tex2Dlod(_CameraGBufferTexture2, float4(uv, 0, 0)).rgb;
+                return all(n < 0.004);
+            }
+
+            // exactly the cleared value: reversed-Z depth of distant terrain is tiny (a 1e-6
+            // threshold took everything past ~100-200 km for empty sky: a ring of missing
+            // atmosphere at that distance through the cut-outs)
+            bool IsFar(float d)
+            {
+            #if defined(UNITY_REVERSED_Z)
+                return d <= 0;
+            #else
+                return d >= 1;
+            #endif
+            }
+
+            // The depth of what lies behind a cut-out with geometry behind it.
+            // The nearer of the depth-behind render (the scene without the cut-out parts'
+            // hulls: terrain, buildings, other vessels) and the behind layer (the nearest hull
+            // behind the window, the cut-out parts' own hulls included); 0 if neither
+            sampler2D_float _RW_BehindDepthTex;
+            float _RW_UseBehindDepth;
+
+            float BehindEye(float2 uv)
+            {
+                float eye = 1e30;
+                float d = tex2Dlod(_RW_BehindDepthTex, float4(uv, 0, 0)).r;
+                if (!IsFar(d)) eye = LinearEyeDepth(d);
+                float4 b = tex2Dlod(_RW_BehindTex, float4(uv, 0, 0));
+                if (b.x > 0.5 && b.y > 0) eye = min(eye, b.y);
+                return eye > 1e29 ? 0 : eye;
+            }
+
+            void fragSkyFix(v2f i, out float depth : SV_Depth)
+            {
+                float2 uv = i.spos.xy / i.spos.w;
+                if (_RW_FlipY > 0.5) uv.y = 1 - uv.y;
+                if (!CutOutPixel(uv))
+                    discard;
+                if (NothingBehind(uv))
+                {
+                #if defined(UNITY_REVERSED_Z)
+                    depth = 0;
+                #else
+                    depth = 1;
+                #endif
+                    return;
+                }
+                // geometry behind: its real depth, if it is known and past the pane
+                if (_RW_UseBehindDepth < 0.5)
+                    discard;
+                float eye = BehindEye(uv);
+                float paneEye = tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).y;
+                if (eye <= paneEye + 0.05)
+                    discard;
+                depth = (1.0 / eye - _ZBufferParams.w) / _ZBufferParams.z;
+            }
+
+
             // x: window strength, y: interior image weight,
             // z: cut-out weight (the main render already shows the scene there); dark pane: neither
             float3 Mask(float2 uv)
@@ -96,11 +172,19 @@ Shader "Hidden/RealWindows/Composite"
                 return Inside(uv, c) ? c : float4(0, 0, 0, 0);
             }
 
-            float4 frag(v2f i) : SV_Target
+            // part 0: the whole composite; 1: all but the glass over cut-outs; 2: only the
+            // glass over cut-outs (pass 3, drawn late: with skyThroughCutOuts the sky and clouds
+            // behind a cut-out are drawn after the composite, so the glass goes over them)
+            float _RW_LateGlass;
+
+            float4 CompositeFrag(v2f i, int part)
             {
                 float2 uv = i.spos.xy / i.spos.w;
                 if (_RW_FlipY > 0.5) uv.y = 1 - uv.y;
 
+                // the late glass: never in the debug views (part 2 never reaches them below)
+                if (part == 2 && (_RW_Debug > 0.5 || tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).r < 0.5))
+                    return float4(0, 0, 0, 0);
                 if (_RW_Debug > 1.5 && _RW_Debug < 2.5)
                 {
                     float hid = tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).r;
@@ -150,8 +234,8 @@ Shader "Hidden/RealWindows/Composite"
 
                 // camera inside a part: its interior shown whole wherever its walls are seen
                 // and no other hull is in front; windows and openings still show outside
-                float4 ins;
-                if (Inside(uv, ins))
+                float4 ins = float4(0, 0, 0, 0);
+                if (part != 2 && Inside(uv, ins))
                     return ins;
 
                 // most of the screen isn't a rendered part: one read and out
@@ -180,7 +264,7 @@ Shader "Hidden/RealWindows/Composite"
                 float show = m > 0 ? mk.y / m : 0;
                 float hole = m > 0 ? mk.z / m : 0;
 
-                if (_RW_Debug > 0.5)
+                if (part != 2 && _RW_Debug > 0.5)
                 {
                     // yellow = window shown; red = hull says window but no matching interior behind it
                     float hm = tex2Dlod(_RW_IdTex, float4(uv, 0, 0)).b > 0.75 ? 1 : 0;
@@ -195,8 +279,25 @@ Shader "Hidden/RealWindows/Composite"
                 float3 interior = tex2Dlod(_RW_InteriorTex, float4(uv, 0, 0)).rgb * show * _RW_Tint.rgb;
                 float3 glint = _RW_SunColor.rgb * s.g * (1 - dirt * 0.7);
                 // through a cut-out the scene is already behind: dim it like the interior would be
+                if (part == 2)
+                    return float4(glint * m * hole, m * (1 - t) * hole);
+                if (part == 1)
+                    return float4(interior * a + glint * m * (1 - hole), m * t * (1 - hole));
                 float alpha = m * (t * (1 - hole) + (1 - t) * hole);
                 return float4(interior * a + glint * m, alpha);
+            }
+
+            float4 frag(v2f i) : SV_Target
+            {
+                // constant parts, so each call is compiled for its own part
+                if (_RW_LateGlass > 0.5)
+                    return CompositeFrag(i, 1);
+                return CompositeFrag(i, 0);
+            }
+
+            float4 fragLate(v2f i) : SV_Target
+            {
+                return CompositeFrag(i, 2);
             }
         ENDCG
 
@@ -224,6 +325,36 @@ Shader "Hidden/RealWindows/Composite"
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment fragInside
+            #pragma target 3.5
+            ENDCG
+        }
+
+        // 2: sky through cut-outs: the depth of what lies behind each cut-out pixel put back
+        Pass
+        {
+            ZTest Always
+            ZWrite On
+            Cull Off
+            ColorMask 0
+
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment fragSkyFix
+            #pragma target 3.5
+            ENDCG
+        }
+
+        // 3: the glass over cut-outs, drawn late (skyThroughCutOuts: after the sky and clouds)
+        Pass
+        {
+            ZTest Always
+            ZWrite Off
+            Cull Off
+            Blend One OneMinusSrcAlpha
+
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment fragLate
             #pragma target 3.5
             ENDCG
         }

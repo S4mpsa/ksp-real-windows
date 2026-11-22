@@ -272,11 +272,11 @@ namespace RealWindows
                     why[(int)PortalPipeline.Redraw.View], why[(int)PortalPipeline.Redraw.Area], why[(int)PortalPipeline.Redraw.Set],
                     why[(int)PortalPipeline.Redraw.Projection], why[(int)PortalPipeline.Redraw.Refresh],
                     why[(int)PortalPipeline.Redraw.Request], why[(int)PortalPipeline.Redraw.Start]);
-                RWLog.Info("status: {0} interiors known, {1} rendered in {2} group(s), {3} skipped (no window in view), {4} occluder parts ({10} drawn), {5:F2} ms CPU per frame; shell/props cache: {6} redraws ({12}), {7} frames reused, kerbals pass skipped in {9} frames (nothing moving); window cut-outs in {8} frames; CPU ms per rendered frame: {11}",
+                RWLog.Info("status: {0} interiors known, {1} rendered in {2} group(s), {3} skipped (no window in view), {4} occluder parts ({10} drawn), {5:F2} ms CPU per frame; shell/props cache: {6} redraws ({12}), {7} frames reused, kerbals pass skipped in {9} frames (nothing moving); window cut-outs in {8} frames (depth behind them rendered in {13}); CPU ms per rendered frame: {11}",
                     pipeline.allInteriors.Count, pipeline.lastInteriorCount, pipeline.lastGroupCount, pipeline.lastCulled,
                     pipeline.occluders.Count, pipeline.TakeAverageMs(), pipeline.staticRedraws, pipeline.staticReuses, pipeline.holeFrames,
-                    pipeline.kerbalSkips, pipeline.lastOccludersDrawn, phases, whys);
-                pipeline.staticRedraws = pipeline.staticReuses = pipeline.holeFrames = pipeline.kerbalSkips = 0;
+                    pipeline.kerbalSkips, pipeline.lastOccludersDrawn, phases, whys, pipeline.behindRenders);
+                pipeline.staticRedraws = pipeline.staticReuses = pipeline.holeFrames = pipeline.kerbalSkips = pipeline.behindRenders = 0;
                 System.Array.Clear(why, 0, why.Length);
             }
         }
