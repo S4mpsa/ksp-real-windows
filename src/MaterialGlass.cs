@@ -11,6 +11,7 @@
 //   _MetallicGlossMap (metallic workflow)    -> alpha = smoothness
 //   _SpecGlossMap     (specular workflow)    -> alpha = smoothness
 //   _SpecMap          (KSP Bumped Spec Mapped)-> luminance of rgb
+//   _MetalMap         (Resurfaced PBR)       -> _MainTex alpha (smoothness)
 //   specular shader with _MainTex            -> _MainTex alpha (KSP spec mask)
 //   transparent sub-mesh on an IVA part      -> always glass (author's window mesh)
 //   mesh named like a window, material says nothing -> always glass (an opaque or
@@ -129,6 +130,9 @@ namespace RealWindows
             if (m.HasProperty("_MetallicGlossMap") && m.GetTexture("_MetallicGlossMap") != null) { prop = "_MetallicGlossMap"; channel = 4; }
             else if (m.HasProperty("_SpecGlossMap") && m.GetTexture("_SpecGlossMap") != null) { prop = "_SpecGlossMap"; channel = 4; }
             else if (m.HasProperty("_SpecMap") && m.GetTexture("_SpecMap") != null) { prop = "_SpecMap"; channel = 5; }
+            // Resurfaced PBR shaders (ReStock PBR, Technicolor): metalness in _MetalMap,
+            // smoothness in the colour map's alpha (o.Smoothness = albedo.a * _Smoothness)
+            else if (m.HasProperty("_MetalMap") && m.HasProperty("_MainTex") && m.GetTexture("_MainTex") != null) { prop = "_MainTex"; channel = 4; }
             else
             {
                 string sn = m.shader != null ? m.shader.name : "";

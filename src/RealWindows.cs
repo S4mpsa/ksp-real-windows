@@ -278,6 +278,7 @@ namespace RealWindows
                     pipeline.kerbalSkips, pipeline.lastOccludersDrawn, phases, whys, pipeline.behindRenders);
                 pipeline.staticRedraws = pipeline.staticReuses = pipeline.holeFrames = pipeline.kerbalSkips = pipeline.behindRenders = 0;
                 System.Array.Clear(why, 0, why.Length);
+                RWLog.Info("cameras: {0}", pipeline.CameraReport());
             }
         }
 

@@ -1775,6 +1775,7 @@ namespace RealWindows
             }
             ShadowQuality shadows = QualitySettings.shadows;
             QualitySettings.shadows = ShadowQuality.Disable;
+            IsolateCamera(behindCam);
             try
             {
                 behindCam.RenderWithShader(ShaderBundle.BehindDepthShader, "RenderType");
@@ -1782,6 +1783,9 @@ namespace RealWindows
             }
             finally
             {
+                // other mods attach their effects to every camera that sees their objects
+                // (during this render's culling): switched off again right away
+                IsolateCamera(behindCam);
                 QualitySettings.shadows = shadows;
                 for (int i = 0; i < behindHidden.Count; i++)
                     if (behindHidden[i] != null)
@@ -1791,6 +1795,72 @@ namespace RealWindows
             }
             matFix.SetTexture("_RW_BehindDepthTex", behindDepthRT);
             return true;
+        }
+
+        // The depth camera is ours and only renders depth: anything another mod hangs on it
+        // must not run. EVE attaches a ScreenSpaceShadowsRenderer to every camera that culls
+        // its invisible "EVE ScreenSpaceShadowsManager" object (layer 15, huge bounds, no
+        // camera name filter); each render it then adds cloud-shadow command buffers to the
+        // sun light and overwrites a global view-projection matrix with this camera's cropped
+        // one. Scatterer's local sky attaches a command buffer the same way. Their
+        // components are disabled (no OnPreCull/OnPreRender/OnPostRender) and command
+        // buffers removed, before and after every render.
+        private readonly HashSet<string> foreignOnDepthCamera = new HashSet<string>();
+
+        private void IsolateCamera(Camera cam)
+        {
+            if (cam == null)
+                return;
+            if (cam.commandBufferCount > 0)
+                cam.RemoveAllCommandBuffers();
+            MonoBehaviour[] mbs = cam.GetComponents<MonoBehaviour>();
+            for (int i = 0; i < mbs.Length; i++)
+            {
+                MonoBehaviour mb = mbs[i];
+                if (mb == null || !mb.enabled)
+                    continue;
+                mb.enabled = false;
+                string type = mb.GetType().FullName;
+                if (foreignOnDepthCamera.Add(type))
+                    RWLog.Info("switched off {0}, which another mod attached to Real Windows' depth camera", type);
+            }
+        }
+
+        // verbose status: what other mods attached to our cameras, and the sun light's
+        // command buffers (a growing count means something adds them and never removes them)
+        public string CameraReport()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("depth camera: ");
+            sb.Append(foreignOnDepthCamera.Count == 0 ? "nothing attached" : "switched off " + string.Join(", ", foreignOnDepthCamera));
+            sb.Append("; interior camera components: ");
+            if (intCam != null)
+            {
+                MonoBehaviour[] mbs = intCam.GetComponents<MonoBehaviour>();
+                int n = 0;
+                for (int i = 0; i < mbs.Length; i++)
+                    if (mbs[i] != null)
+                    {
+                        sb.Append(n++ > 0 ? ", " : "").Append(mbs[i].GetType().Name).Append(mbs[i].enabled ? "" : " (off)");
+                    }
+                if (n == 0) sb.Append("none");
+                sb.Append(", ").Append(intCam.commandBufferCount).Append(" command buffers");
+            }
+            Light sun = Sun.Instance != null ? Sun.Instance.sunLight : null;
+            sb.Append("; sun light command buffers: ").Append(sun != null ? sun.commandBufferCount.ToString() : "?");
+            // every active camera: name, command buffers, scripts (something that grows after
+            // a vessel switch or undocking shows up here)
+            Camera[] cams = Camera.allCameras;
+            sb.Append("; ").Append(cams.Length).Append(" active cameras:");
+            for (int i = 0; i < cams.Length; i++)
+            {
+                Camera c = cams[i];
+                if (c == null) continue;
+                sb.Append(i > 0 ? "," : "").Append(' ').Append(c.name)
+                  .Append(" (").Append(c.commandBufferCount).Append(" cb, ")
+                  .Append(c.GetComponents<MonoBehaviour>().Length).Append(" scripts)");
+            }
+            return sb.ToString();
         }
 
         private void ReleaseBehind()
