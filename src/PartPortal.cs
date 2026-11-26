@@ -267,9 +267,10 @@ namespace RealWindows
                     DrawItem di = new DrawItem(r, s);
                     if (hasIva && !excluded)
                     {
-                        if (flagRenderers.Contains(r))
+                        if (flagRenderers.Contains(r) || MaterialGlass.NamedAsLamp(r.name))
                         {
-                            // flag decals are transparent quads on the hull, not glass
+                            // flag decals are transparent quads on the hull, lamp lenses are
+                            // lit like windows: neither is glass
                             di.glass = GlassInfo.None;
                             di.solid = true;
                         }
@@ -294,7 +295,7 @@ namespace RealWindows
                     if (g == null) continue;
                     total++;
                     if (g.informative) informative++;
-                    string why = exterior[i].solid ? ", flag decal: solid" : exterior[i].mask == null && g.channel != 6 ? ", no mask: " + HullMasks.WhyNoMask(exterior[i].r, g) : "";
+                    string why = exterior[i].solid ? ", flag decal or lamp: solid" : exterior[i].mask == null && g.channel != 6 ? ", no mask: " + HullMasks.WhyNoMask(exterior[i].r, g) : "";
                     sources += string.Format(" [{0} '{1}'{2} {3:P1}{4}{5}{6}]", g.source, exterior[i].r != null ? exterior[i].r.name : "?",
                         g.tex != null ? " " + g.tex.name : "", g.glossyFraction,
                         g.light != null ? string.Format(", lightmap {0} {1:P1}", g.light.name, g.litFraction) : "",

@@ -90,6 +90,20 @@ namespace RealWindows
             return true;
         }
 
+        // Lamp lenses are lit, like windows, and often have nothing of the IVA behind them
+        // (the USI AES pod's 'Lamp01_001'): a sub-mesh named like a lamp is never a window.
+        private static readonly string[] LampNames = { "lamp", "beacon", "spotlight", "headlight", "floodlight", "searchlight" };
+
+        public static bool NamedAsLamp(string name)
+        {
+            if (string.IsNullOrEmpty(name) || NamedAsGlass(name))
+                return false;
+            for (int i = 0; i < LampNames.Length; i++)
+                if (name.IndexOf(LampNames[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            return false;
+        }
+
         private static readonly string[] LightProps = { "_Emissive", "_EmissiveMap", "_EmissionMap", "_Emission" };
 
         private static GlassInfo Detect(Material m)

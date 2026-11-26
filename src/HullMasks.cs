@@ -299,12 +299,21 @@ namespace RealWindows
             }
             RenderTexture.active = prev;
 
-            bool partLit = false;
-            for (int i = 0; i < p.exterior.Count && !partLit; i++)
-                partLit = p.exterior[i].glass != null && p.exterior[i].glass.light != null;
+            bool partLit = false, partGlass = false;
+            for (int i = 0; i < p.exterior.Count; i++)
+            {
+                GlassInfo eg = p.exterior[i].glass;
+                if (eg == null) continue;
+                partLit |= eg.light != null;
+                // a window-named mesh, or see-through glass named like it (not plants,
+                // arrows or decal quads, which also count as the author's glass)
+                Renderer er = p.exterior[i].r;
+                partGlass |= eg.channel == 6 && (eg.named || (er != null && MaterialGlass.NamedAsGlass(er.name)));
+            }
             MaskParams mp = new MaskParams
             {
                 partLit = partLit,
+                partGlass = partGlass,
                 seedGloss = (byte)Mathf.Clamp(RWSettings.glassThreshold * 255f, 1f, 255f),
                 seedLight = (byte)Mathf.Clamp(RWSettings.lightThreshold * 255f, 1f, 255f),
                 openEvidence = (byte)Mathf.Clamp(Mathf.Ceil(RWSettings.probeOpenFraction * 255f), 1f, 255f),

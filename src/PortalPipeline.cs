@@ -109,6 +109,7 @@ namespace RealWindows
         private readonly List<Renderer> reordered = new List<Renderer>();
         private readonly List<int> reorderedWas = new List<int>();
         private readonly HashSet<Renderer> reorderSeen = new HashSet<Renderer>();
+        public readonly DecalStandIns decalStandIns = new DecalStandIns();  // Conformal Decals on reordered hulls
         private bool coversActive;
         private const int CoverOrderBase = 1000;
         public int holeFrames;     // for the status line
@@ -275,6 +276,7 @@ namespace RealWindows
             Camera.onPostRender -= OnPostRenderAny;
             GameEvents.OnCameraChange.Remove(OnCameraChange);
             DisableCovers();
+            decalStandIns.Dispose();
             for (int i = 0; i < covers.Count; i++)
                 if (covers[i] != null)
                     UnityEngine.Object.Destroy(covers[i].gameObject);
@@ -643,6 +645,7 @@ namespace RealWindows
             }
             coversActive = true;
             holeFrames++;
+            decalStandIns.Show(reorderSeen, CoverOrderBase);
         }
 
         // Viewport rect (x0, y0, x1, y1) grown by the feather and a couple of pixels.
@@ -687,6 +690,7 @@ namespace RealWindows
         {
             if (!coversActive)
                 return;
+            decalStandIns.Hide();
             for (int i = 0; i < covers.Count; i++)
                 if (covers[i] != null)
                     covers[i].enabled = false;

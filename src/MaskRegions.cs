@@ -6,7 +6,8 @@
 //      away completely and a gap in the IVA evidence can't tear a window apart.
 //      Lit and tinted (glass is bluish): any opening nearby will do.
 //      Lit but neutral (lamps, strips): a real opening behind most of it, and
-//      only if nothing lit and tinted exists, which would mark the real windows.
+//      only if nothing lit and tinted exists, which would mark the real windows,
+//      and the part has no glass or window-named mesh, which would too.
 //      Gloss only: a real opening behind most of it, and only on a texture with
 //      no lightmap. Where one exists, what it leaves dark isn't a window.
 //      Unlit warm paint (gold foil, copper, brown) is never a window, and
@@ -52,6 +53,7 @@ namespace RealWindows
         public bool acceptAll;             // Trust: skip the IVA confirmation
         public bool addOpenings;           // Union: openings without gloss are windows too
         public bool partLit;               // another texture of the part has a lightmap: its windows are lit there
+        public bool partGlass;             // the part has the author's glass or a window-named mesh: lit untinted regions are lamps
     }
 
     public static class MaskRegions
@@ -121,7 +123,11 @@ namespace RealWindows
                 else if (p.seedFromOpenings) ok = r.tinted; // the opening is given; only glass-coloured paint counts
                 else if (p.acceptAll) ok = true;
                 else if (r.lit && r.tinted) ok = near >= p.minOpenLit;
-                else if (r.lit) ok = !tintedLitExists && here >= p.minOpenFraction;
+                // Lit but untinted: lamps as often as windows. Not one where tinted lit
+                // glass marks this texture's windows, nor on a part whose windows are
+                // already a glass or window-named mesh (the USI AES pod's lamp lenses:
+                // their own lit texture, nothing of the small IVA behind them).
+                else if (r.lit) ok = !tintedLitExists && !p.partGlass && here >= p.minOpenFraction;
                 // Neutral gloss counts only on parts with no lightmap at all: where the
                 // author lit the windows on another texture, shiny grey paint here is
                 // metal (the SSPX 'Cronus' centrifuge's struts and spin core).
