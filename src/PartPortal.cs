@@ -28,6 +28,10 @@ namespace RealWindows
 
         // exterior (all parts): drawn into the hull ID pass
         public readonly List<DrawItem> exterior = new List<DrawItem>();
+        // Other mods' copies of hull meshes drawn over the hull (Losket's scorch and
+        // dust): not part of the hull passes, but moved with the hull's sorting order
+        // for the cut-outs so they are still drawn after it.
+        public readonly List<Renderer> overlays = new List<Renderer>();
         private float nextExteriorScan;
 
         // interior (IVA parts only)
@@ -236,6 +240,7 @@ namespace RealWindows
             // EVA kerbals every second: helmets, suits and visors come and go
             nextExteriorScan = now + (isKerbal ? 1f : hasIva ? 5f : 20f) + UnityEngine.Random.value * (isKerbal ? 0.2f : 1f); // stagger
             exterior.Clear();
+            overlays.Clear();
             if (hasIva && !excluded)
                 CollectFlagRenderers();
             Renderer[] rs = part.GetComponentsInChildren<Renderer>(true);
@@ -247,6 +252,13 @@ namespace RealWindows
                 // child parts can be nested under this part's transform: keep only our own
                 if (r.GetComponentInParent<Part>() != part)
                     continue;
+                // A copy of the hull mesh at the hull's depth: in the hull pass it would
+                // overwrite the hull's window state with its own (solid).
+                if (IsHullOverlay(r))
+                {
+                    overlays.Add(r);
+                    continue;
+                }
                 int subs = SubMeshCount(r);
                 Material[] mats = r.sharedMaterials;
                 for (int s = 0; s < subs && s < mats.Length; s++)
@@ -689,6 +701,20 @@ namespace RealWindows
             string n = m.shader != null ? m.shader.name : "";
             return n.IndexOf("DepthMask", StringComparison.OrdinalIgnoreCase) >= 0
                 || n.IndexOf("Depth Mask", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Losket (burn, dust and exhaust marks): a MeshRenderer or SkinnedMeshRenderer
+        // named losket...Overlay on the same mesh as its hull renderer, a child of it,
+        // drawn with a Losket/ shader (Geometry+100 and up, alpha-blended, no depth write).
+        private static bool IsHullOverlay(Renderer r)
+        {
+            string n = r.name;
+            if (n.StartsWith("losket", StringComparison.OrdinalIgnoreCase)
+                && n.EndsWith("Overlay", StringComparison.OrdinalIgnoreCase))
+                return true;
+            Material m = r.sharedMaterial;
+            return m != null && m.shader != null
+                && m.shader.name.StartsWith("Losket/", StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool SkipExteriorShader(Material m)

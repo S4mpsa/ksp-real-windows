@@ -642,6 +642,17 @@ namespace RealWindows
                     reorderedWas.Add(r.sortingOrder);
                     r.sortingOrder = CoverOrderBase + 2 * i + 1;
                 }
+                // drawn over the hull by other mods (Losket): same order, their later
+                // render queue keeps them after the hull
+                for (int k = 0; k < p.overlays.Count; k++)
+                {
+                    Renderer r = p.overlays[k];
+                    if (r == null || !reorderSeen.Add(r))
+                        continue;
+                    reordered.Add(r);
+                    reorderedWas.Add(r.sortingOrder);
+                    r.sortingOrder = CoverOrderBase + 2 * i + 1;
+                }
             }
             coversActive = true;
             holeFrames++;
